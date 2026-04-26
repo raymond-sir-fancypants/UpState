@@ -6,13 +6,23 @@ UpState gives you a simple, predictable way to manage application state — with
 
 ---
 
+## What's new in v1.0.1
+
+- **Hot config plugging** — calling `config()` after state already exists is now fully supported. Any collections listed in `persistantCollections` that are already in state will be persisted immediately when `config()` runs.
+- **Immutable `Result` objects** — `Result` instances are now frozen. The wrapped value is stored in a private field and cannot be modified from outside.
+- **`Result` iteration methods** — `iterateAsMap()` and `iterateAsList()` reduce boilerplate when transforming state.
+- **`get()` with no arguments** — calling `UpState.get()` now returns a full clone of the entire state tree.
+- **Call-level persistence priority** — passing `persistence` directly to `set()` now correctly overrides the collection's config-level persistence for that call.
+
+---
+
 ## Features
 
 - 📦 Zero dependencies
 - 🔒 Fully encapsulated state — enforced by private class fields
 - 🧠 In-memory state tree with optional persistence
 - 🔁 Event-driven — listen for any state change via the `update` event
-- 🛡️ Safe `Result` wrapper — never throws on missing data
+- 🛡️ Safe, immutable `Result` wrapper — never throws on missing data
 - 📂 Nested state support via dot or slash routes (`"user/profile/name"`)
 - ⚡ Batch operations for efficient multi-value reads and writes
 
@@ -28,25 +38,25 @@ import UpState from './UpState.js';
 
 ---
 
-## Important — Call `config()` First
+## Recommended — Call `config()` First
 
-`config()` should be the **very first call** you make, before any `set`, `get`, or `remove` operations. This ensures persistence rules and event settings are in place from the start.
+`config()` should ideally be the **first call** you make, before any `set`, `get`, or `remove` operations. This ensures persistence rules and event settings are in place from the start.
 
-Calling `config()` after state has already been written will not retroactively persist existing data.
+As of v1.0.1, calling `config()` after state already exists is safe — any matching collections already in state will be persisted immediately.
 
 ```js
-// ✅ Correct — config before anything else
+// ✅ Recommended
 import UpState from './UpState.js';
 
 UpState.config({
   persistantCollections: [{ user: "permanent" }, { cart: "session" }]
 });
 
-UpState.set({ collection: "user", state: { name: "Alice" } }); // will persist
+UpState.set({ collection: "user", state: { name: "Alice" } });
 ```
 
 ```js
-// ⚠️ Avoid — set runs before config, persistence won't apply
+// ✅ Also valid in v1.0.1 — existing state is persisted when config() runs
 UpState.set({ collection: "user", state: { name: "Alice" } });
 UpState.config({ persistantCollections: [{ user: "permanent" }] });
 ```
@@ -58,7 +68,7 @@ UpState.config({ persistantCollections: [{ user: "permanent" }] });
 ```js
 import UpState from './UpState.js';
 
-// 1. Configure first
+// 1. Configure first (recommended)
 UpState.config({
   persistantCollections: [{ user: "permanent" }, { cart: "session" }]
 });
@@ -70,13 +80,16 @@ UpState.set({ collection: "user", state: { name: "Alice", age: 30 } });
 const user = UpState.get("user").raw;
 console.log(user.name); // "Alice"
 
-// 4. Listen for changes
+// 4. Get full state snapshot
+const everything = UpState.get().raw;
+
+// 5. Listen for changes
 UpState.addEventListener("update", (e) => {
   console.log(e.detail.action);     // "set"
   console.log(e.detail.collection); // "user"
 });
 
-// 5. Remove state
+// 6. Remove state
 UpState.remove("user");
 ```
 
@@ -84,14 +97,14 @@ UpState.remove("user");
 
 ## State Encapsulation
 
-The internal state tree is stored in a **private class field** (`#state`). This means it is completely inaccessible from outside the class — the JavaScript engine enforces this at a language level, not just by convention.
+The internal state tree is stored in a **private class field** (`#state`). This is enforced at the language level — there is no workaround.
 
 ```js
-UpState.#state;        // SyntaxError — always, no workaround
+UpState.#state;        // SyntaxError — always
 UpState.state = {};    // Silently ignored — Object.freeze blocks this
 ```
 
-All reads and writes must go through the provided methods (`set`, `get`, `remove`, and their batch equivalents). This guarantees that events always fire, persistence always runs, and the state tree is never accidentally corrupted.
+All reads and writes must go through the provided methods. This guarantees that events always fire, persistence always runs, and the state tree is never accidentally corrupted.
 
 ---
 
@@ -99,7 +112,7 @@ All reads and writes must go through the provided methods (`set`, `get`, `remove
 
 ### `UpState.config(options)`
 
-Configures UpState behaviour. **Should be called first, before any other method.**
+Configures UpState behaviour. Recommended as the first call, but safe to call at any point.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -126,28 +139,28 @@ Sets a value in the state tree.
 | `collection` | `string` | ✅ | Top-level collection name |
 | `state` | `*` | ✅ | The value to store (anything except `undefined`) |
 | `route` | `string` | ❌ | Dot or slash path within the collection |
-| `persistence` | `"session"` \| `"permanent"` | ❌ | Persist to storage. Overridden by `config()` if the collection is listed there. |
+| `persistence` | `"session"` \| `"permanent"` | ❌ | Overrides config-level persistence for this call only |
 
 ```js
-// Set an entire collection
 UpState.set({ collection: "user", state: { name: "Alice" } });
-
-// Set a nested value
 UpState.set({ collection: "user", route: "profile/age", state: 30 });
 
-// Set with persistence (only needed if not already in config)
-UpState.set({ collection: "cart", state: [], persistence: "session" });
+// Override config-level persistence for this call only
+UpState.set({ collection: "cache", state: {}, persistence: "session" });
 ```
 
 ---
 
-### `UpState.get(collection, route?)`
+### `UpState.get(collection?, route?)`
 
 Retrieves a value from the state tree. Returns a [`Result`](#the-result-object) — never throws on missing data.
 
+Calling `get()` with no arguments returns a full clone of the entire state tree.
+
 ```js
-const result = UpState.get("user");
-const age    = UpState.get("user", "profile/age").raw;
+const user    = UpState.get("user").raw;
+const age     = UpState.get("user", "profile/age").raw;
+const allData = UpState.get().raw; // full state snapshot
 ```
 
 ---
@@ -206,7 +219,7 @@ UpState.batchRemove([
 
 ## The `Result` Object
 
-All `get` calls return a `Result` object with three ways to consume the data:
+All `get` calls return an immutable `Result` object. The wrapped value is stored in a private field and cannot be changed from outside. Three getters let you consume the data in different formats:
 
 | Getter | Returns | Null-safe? |
 |---|---|---|
@@ -215,7 +228,7 @@ All `get` calls return a `Result` object with three ways to consume the data:
 | `.map` | Always a plain object | ✅ |
 
 ```js
-const result = UpState.get("tags"); // e.g. stored as ["js", "css"]
+const result = UpState.get("tags"); // stored as ["js", "css"]
 
 result.raw;  // ["js", "css"]
 result.list; // ["js", "css"]
@@ -225,6 +238,34 @@ const empty = UpState.get("doesNotExist");
 empty.raw;   // null
 empty.list;  // []
 empty.map;   // {}
+```
+
+### Iteration Methods
+
+Two methods let you transform state without extra boilerplate. Both return a new value — they do not mutate the `Result`.
+
+#### `result.iterateAsMap(callback)`
+
+Iterates over the value as a plain object. The callback receives `(key, value)` and its return value becomes the new value for that key. If the callback returns `undefined`, the key is set to `null`.
+
+```js
+const prices = UpState.get("prices");
+// { apple: 1.00, banana: 0.50 }
+
+const discounted = prices.iterateAsMap((key, value) => value * 0.9);
+// { apple: 0.9, banana: 0.45 }
+```
+
+#### `result.iterateAsList(callback)`
+
+Iterates over the value as an array. The callback receives `(index, value)` and its return value becomes the new item at that index. If the callback returns `undefined`, the item is set to `null`.
+
+```js
+const tags = UpState.get("tags");
+// ["js", "css", "html"]
+
+const upper = tags.iterateAsList((i, value) => value.toUpperCase());
+// ["JS", "CSS", "HTML"]
 ```
 
 ---
@@ -259,7 +300,7 @@ Same shape as `set`, with `state` being the parent object after deletion.
 ### `batchSet`
 ```js
 UpState.addEventListener("update", (e) => {
-  const { action, count, collections, stateInput, state } = e.detail;
+  const { action, count, collections, stateInputs, state } = e.detail;
 });
 ```
 
@@ -278,7 +319,7 @@ UpState throws `UpStateError` for invalid usage. Each error has a `code` propert
 
 | Code | Thrown by | Reason |
 |---|---|---|
-| `MISSING_COLLECTION_REF` | `set`, `get`, `remove` | `collection` is missing or empty |
+| `MISSING_COLLECTION_REF` | `set`, `get`, `remove` | `collection` is missing or empty string |
 | `INVALID_COLLECTION_REF` | `set`, `get`, `remove` | `collection` is not a string |
 | `INVALID_STATE_VALUE` | `set` | `state` is `undefined` |
 | `INVALID_PERSISTENCE_VALUE` | `set` | `persistence` is not `"session"` or `"permanent"` |
@@ -301,18 +342,20 @@ try {
 
 ## Persistence
 
-State is persisted under a single `"UpState"` key in storage to keep things tidy. On page load, UpState automatically restores any previously saved state from both `localStorage` and `sessionStorage`.
+State is stored under a single `"UpState"` key in storage to keep things tidy. On page load, UpState automatically restores any previously persisted state from both `localStorage` and `sessionStorage` and merges them into the initial state.
 
-Persistence can be set per-call or globally via `config()`. Config-level persistence takes priority:
+Persistence priority — from highest to lowest:
+1. **Call-level** — `persistence` passed directly to `set()`
+2. **Config-level** — collection listed in `persistantCollections`
+3. **None** — in-memory only
 
 ```js
-// Globally via config (recommended — takes priority over per-call)
 UpState.config({
-  persistantCollections: [{ cart: "session" }]
+  persistantCollections: [{ cart: "session" }] // config-level
 });
 
-// Per-call (only needed for collections not in config)
-UpState.set({ collection: "cart", state: [], persistence: "session" });
+// Call-level overrides config for this one call
+UpState.set({ collection: "cart", state: { item: "shoes" }, persistence: "permanent" });
 ```
 
 ---

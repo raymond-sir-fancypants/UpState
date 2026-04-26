@@ -1,5 +1,7 @@
 "use strict";
 
+// UpState version 1.0.1
+
 /**
  * @class Utility
  * @description Internal helper class. Not part of the public API.
@@ -102,9 +104,12 @@ class UpStateError extends Error {
 /**
  * @class Result
  * @description Wraps a value returned from a `get` or `batchGet` call.
- * Provides convenience getters to consume the data in different formats
- * without extra boilerplate. All getters are safe — they never throw, even
- * when the underlying value is `null`.
+ * Provides convenience getters and iteration methods to consume data without
+ * extra boilerplate. All getters are null-safe — they never throw, even when
+ * the underlying value is `null`.
+ *
+ * Result instances are immutable. Once created, the wrapped value cannot
+ * be changed from outside the class.
  *
  * @example
  * const result = UpState.get("users");
@@ -116,11 +121,18 @@ class UpStateError extends Error {
 class Result {
 
     /**
-     * @param {*} result - The value to wrap.
+     * The wrapped value. Private and immutable — access via `.raw`, `.list`, or `.map`.
+     * @type {*}
+     * @private
      */
-    constructor(result) {
-        /** @type {*} */
-        this.result = (result === undefined || result === null) ? null : result;
+    #data;
+
+    /**
+     * @param {*} input - The value to wrap.
+     */
+    constructor(input) {
+        this.#data = (input === undefined || input === null) ? null : input;
+        Object.freeze(this);
     }
 
     /**
@@ -128,7 +140,7 @@ class Result {
      * @type {*}
      */
     get raw() {
-        return this.result;
+        return this.#data;
     }
 
     /**
@@ -140,10 +152,12 @@ class Result {
      * @type {Array}
      */
     get list() {
-        if (this.raw === null) return [];
-        if (Array.isArray(this.raw)) return this.result;
-        if (typeof this.result === "object" && this.result.constructor === Object) return Object.values(this.raw);
-        return [this.raw];
+        if (this.#data === null) return [];
+        if (Array.isArray(this.#data)) return this.#data;
+        if (typeof this.#data === "object" && Object.prototype.toString.call(this.#data) === '[object Object]') {
+            return Object.values(this.#data);
+        }
+        return [this.#data];
     }
 
     /**
@@ -155,14 +169,66 @@ class Result {
      * @type {Object}
      */
     get map() {
-        if (this.raw === null) return {};
-        if (typeof this.result === "object" && !Array.isArray(this.raw)) return this.result;
-        if (Array.isArray(this.raw)) {
+        if (this.#data === null) return {};
+        if (typeof this.#data === "object" && !Array.isArray(this.#data)) return this.#data;
+        if (Array.isArray(this.#data)) {
             const map = {};
-            this.result.forEach((item, index) => { map[index] = item; });
+            this.#data.forEach((item, index) => { map[index] = item; });
             return map;
         }
-        return { 0: this.result };
+        return { 0: this.#data };
+    }
+
+    /**
+     * Iterates over the value as a map (plain object), calling `callback` for
+     * each key-value pair and returning a new object with the results.
+     * If the callback returns `undefined`, the key is set to `null`.
+     *
+     * Useful for transforming object state without extra boilerplate.
+     *
+     * @param {function(key: string, value: *): *} callBack - Called with each key and value.
+     * @returns {Object} A new object with the transformed values.
+     *
+     * @example
+     * const result = UpState.get("prices");
+     * const discounted = result.iterateAsMap((key, value) => value * 0.9);
+     */
+    iterateAsMap(callBack) {
+        const currentMap = this.map; // Call getter once to avoid repeated access
+        const keys = Object.keys(currentMap);
+        const newMap = {};
+
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            const newValue = callBack(key, currentMap[key]);
+            newMap[key] = newValue ?? null;
+        }
+        return newMap;
+    }
+
+    /**
+     * Iterates over the value as a list (array), calling `callback` for each
+     * item and returning a new array with the results.
+     * If the callback returns `undefined`, the item is set to `null`.
+     *
+     * Useful for transforming array state without extra boilerplate.
+     *
+     * @param {function(index: number, value: *): *} callBack - Called with each index and value.
+     * @returns {Array} A new array with the transformed values.
+     *
+     * @example
+     * const result = UpState.get("tags");
+     * const upper = result.iterateAsList((i, value) => value.toUpperCase());
+     */
+    iterateAsList(callBack) {
+        const currentList = this.list; // Cache to avoid repeated getter calls
+        const newArray = [];
+
+        for (let i = 0; i < currentList.length; i++) {
+            const newValue = callBack(i, currentList[i]);
+            newArray.push(newValue ?? null);
+        }
+        return newArray;
     }
 }
 
@@ -255,19 +321,18 @@ class StorageHandler {
  *
  * ---
  *
- * **Important — call `config()` first:**
- * While the library works without it, `config()` should be the very first
- * call you make before any `set`, `get`, or `remove` operations. This ensures
- * persistence rules and event settings are in place from the start. Calling
- * `config()` after state has already been written will not retroactively
- * persist existing data.
+ * **Recommended — call `config()` first:**
+ * `config()` should ideally be the first call you make before any `set`, `get`,
+ * or `remove` operations. That said, as of v1.0.1, calling `config()` after
+ * state already exists is supported — it will retroactively persist any
+ * collections listed in `persistantCollections` that are already in state.
  *
  * ```js
- * // ✅ Correct — config before anything else
+ * // ✅ Recommended — config before anything else
  * UpState.config({ persistantCollections: [{ user: "permanent" }] });
  * UpState.set({ collection: "user", state: { name: "Alice" } });
  *
- * // ⚠️ Avoid — persistence won't apply to the set call below
+ * // ✅ Also valid in v1.0.1 — existing state will be persisted on config
  * UpState.set({ collection: "user", state: { name: "Alice" } });
  * UpState.config({ persistantCollections: [{ user: "permanent" }] });
  * ```
@@ -278,11 +343,10 @@ class StorageHandler {
  * The internal state tree is stored in a private class field (`#state`).
  * It cannot be read or modified from outside the class — the JS engine
  * enforces this hard. All access must go through the provided methods.
- * Any attempt to access `#state` directly will throw a `SyntaxError`.
  *
  * ```js
- * UpState.#state;          // SyntaxError — always
- * UpState.state = {};      // Silently ignored — Object.freeze blocks this
+ * UpState.#state;       // SyntaxError — always
+ * UpState.state = {};   // Silently ignored — Object.freeze blocks this
  * ```
  *
  * @fires State#update
@@ -339,9 +403,10 @@ class State extends EventTarget {
     /**
      * Configures UpState behaviour.
      *
-     * **This should be the first call you make** before any `set`, `get`, or
-     * `remove` operations. Calling it after state has already been written will
-     * not retroactively persist existing data.
+     * Calling `config()` first is recommended, but as of v1.0.1 it is safe to
+     * call it after state has already been written. Any collections listed in
+     * `persistantCollections` that already exist in state will be persisted
+     * immediately when `config()` runs.
      *
      * @param {Object} options
      * @param {Array<Object>} [options.persistantCollections=[]] -
@@ -353,11 +418,16 @@ class State extends EventTarget {
      * @throws {UpStateError} MISSING_CONFIG_ERR — if `persistantCollections` is not an array.
      *
      * @example
-     * // Place this at the top of your app entry point, before anything else
+     * // Recommended: call at the top of your app entry point
      * UpState.config({
-     *   persistantCollections: [{ users: "permanent" }, { cart: "session" }],
+     *   persistantCollections: [{ user: "permanent" }, { cart: "session" }],
      *   allowEventDispatches: true
      * });
+     *
+     * @example
+     * // Also valid in v1.0.1 — existing state is persisted immediately
+     * UpState.set({ collection: "user", state: { name: "Alice" } });
+     * UpState.config({ persistantCollections: [{ user: "permanent" }] });
      */
     config({
         persistantCollections = [],
@@ -367,6 +437,19 @@ class State extends EventTarget {
 
         if (Array.isArray(persistantCollections)) {
             this.#persistantCollections = persistantCollections;
+
+            // Retroactively persist any collections that already exist in state.
+            // This makes late config() calls safe — existing data won't be lost.
+            this.#persistantCollections.forEach(collection => {
+                const key = Object.keys(collection)[0];
+
+                if (key in this.#state) {
+                    const persistence = collection[key];
+                    const state = this.#state[key];
+                    StorageHandler.set({ collection: key, state, persistence });
+                }
+            });
+
         } else {
             throw new UpStateError(
                 "persistantCollections should be an array of collection names",
@@ -379,13 +462,17 @@ class State extends EventTarget {
      * Sets a value in the state tree. Optionally persists it to storage
      * and fires an `update` event.
      *
+     * Call-level `persistence` takes priority over config-level persistence,
+     * allowing you to override storage behaviour for individual writes.
+     *
      * @param {Object} options
      * @param {string} options.collection - The top-level collection to write to.
      * @param {*} options.state - The value to store. Cannot be `undefined`.
      * @param {string} [options.route] - Dot or slash separated path within the collection
      *   (e.g. `"profile/name"` or `"profile.name"`).
      * @param {"session"|"permanent"} [options.persistence] - Persist to storage.
-     *   Overridden by `persistantCollections` config if the collection is listed there.
+     *   If provided, this overrides the persistence set in `config()` for this call only.
+     *   If omitted, falls back to the collection's config-level persistence.
      * @param {boolean} [dispatchUpdateEvent=true] - Whether to fire the `update` event.
      *   Set to `false` internally by batch methods to defer the event.
      *
@@ -397,6 +484,8 @@ class State extends EventTarget {
      * @example
      * UpState.set({ collection: "user", state: { name: "Alice" } });
      * UpState.set({ collection: "user", route: "profile/age", state: 30 });
+     *
+     * // Override config-level persistence for this call only
      * UpState.set({ collection: "cart", state: [], persistence: "session" });
      */
     set({ collection, state, route, persistence }, dispatchUpdateEvent = true) {
@@ -433,15 +522,18 @@ class State extends EventTarget {
             }
         }
 
-        // Config-level persistence overrides call-level persistence
-        const markedForPersistance = this.#persistantCollections.find(obj => collection in obj);
-        if (markedForPersistance) {
-            persistence = markedForPersistance[collection];
+        // Call-level persistence takes priority over config-level.
+        // Only fall back to config if no valid call-level value was provided.
+        const markedForPersistence = this.#persistantCollections.find(obj => collection in obj);
+        const persistenceValue = String(persistence).toLowerCase();
+
+        if (markedForPersistence && !(persistenceValue === "permanent" || persistenceValue === "session")) {
+            persistence = markedForPersistence[collection];
         }
 
         if (persistence) {
-            const persistenceValue = String(persistence).toLowerCase();
-            if (persistenceValue === "permanent" || persistenceValue === "session") {
+            const resolvedPersistence = String(persistence).toLowerCase();
+            if (resolvedPersistence === "permanent" || resolvedPersistence === "session") {
                 StorageHandler.set({ collection, state, route, persistence });
             } else {
                 throw new UpStateError(
@@ -473,20 +565,32 @@ class State extends EventTarget {
      * Retrieves a value from the state tree. Never throws on missing data —
      * returns a `Result` wrapping `null` instead.
      *
-     * @param {string} collection - The collection to read from.
+     * If called with no arguments (or `undefined` as the collection), returns
+     * a `Result` wrapping a full clone of the entire state tree. Passing an
+     * empty string still throws, as that is likely a mistake.
+     *
+     * @param {string} [collection] - The collection to read from.
+     *   Omit entirely to retrieve the full state tree.
      * @param {string} [route] - Dot or slash separated path within the collection.
      * @returns {Result} A `Result` object wrapping the value.
      *
-     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is missing or empty.
-     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string.
+     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is an empty string.
+     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string (and not `undefined`).
      *
      * @example
-     * const result = UpState.get("user");
-     * const name = UpState.get("user", "profile/name").raw;
+     * const user    = UpState.get("user").raw;
+     * const name    = UpState.get("user", "profile/name").raw;
+     * const allData = UpState.get().raw; // full state snapshot
      */
     get(collection, route) {
 
-        if (collection === undefined || collection === "") {
+        // No collection = return a full clone of the entire state tree
+        if (collection === undefined) {
+            return new Result(structuredClone(this.#state));
+        }
+
+        // Empty string is likely a mistake — throw rather than silently returning all state
+        if (collection === "") {
             throw new UpStateError("collection name is required", "MISSING_COLLECTION_REF");
         }
 
@@ -589,20 +693,20 @@ class State extends EventTarget {
         }
 
         const collections = [];
-        const stateInput = {};
+        const stateInputs = {};
 
         arrayOfSetObjects.forEach(setObject => {
             this.set(setObject, false);
 
-            if (!stateInput[setObject.collection]) {
-                stateInput[setObject.collection] = [];
+            if (!stateInputs[setObject.collection]) {
+                stateInputs[setObject.collection] = [];
             }
 
             const logState = (typeof setObject.state === "object")
                 ? structuredClone(setObject.state)
                 : setObject.state;
 
-            stateInput[setObject.collection].push(logState);
+            stateInputs[setObject.collection].push(logState);
             collections.push(setObject.collection);
         });
 
@@ -613,7 +717,7 @@ class State extends EventTarget {
                     count: arrayOfSetObjects.length,
                     state: structuredClone(this.#state),
                     collections: [...new Set(collections)],
-                    stateInput
+                    stateInputs
                 },
                 cancelable: true,
             }));
