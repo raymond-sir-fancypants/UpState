@@ -1,20 +1,46 @@
 "use strict";
 
-// upstate version 1.0.1
+// upstate version 1.2.0
 
 class Utility {
 
+    static JSONHydrator(jsonString) {
+
+        const raw = jsonString;
+
+        if (!raw) return {};
+
+        try {
+            return JSON.parse(raw, (k, v) => {
+                // Regex to catch ISO date strings automatically
+                const isISO = typeof v === 'string' &&
+                    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(v);
+                return isISO ? new Date(v) : v;
+            });
+        } catch (e) {
+            return JSON.parse(raw);
+        }
+
+    }
+
     static deepMerge(target, source) {
-        target = structuredClone(target);
+        const output = structuredClone(target);
         source = structuredClone(source);
 
         for (const key in source) {
-            if (source[key] instanceof Object && key in target) {
-                Object.assign(source[key], this.deepMerge(target[key], source[key]));
+            if (
+                source[key] &&
+                typeof source[key] === "object"
+            ) {
+                // Recursively merge nested objects
+                output[key] = this.deepMerge(output[key] || {}, source[key]);
+            } else {
+                // Primitives: source replaces target
+                output[key] = source[key];
             }
         }
-        Object.assign(target || {}, source);
-        return target;
+
+        return output;
     }
 
     static getPathInfo(collection, route, state, createPath = false) {
@@ -43,6 +69,55 @@ class Utility {
         };
     }
 }
+
+const objectA = {
+  id: "primary-instance",
+  active: true,
+  version: 1.0,
+  metadata: {
+    author: "Admin",
+    tags: ["vanilla", "js", "web"],
+    stats: {
+      uptime: 99.9,
+      errors: 0
+    }
+  },
+  connection_logs: [
+    { id: 1, type: "ping", status: "ok" },
+    { id: 2, type: "ping", status: "ok" }
+  ],
+  settings: {
+    theme: "dark",
+    notifications: {
+      email: true,
+      push: false
+    }
+  },
+  unused_key: "i should stay here"
+};
+
+const objectB = {
+  id: "updated-instance", // Collision: should overwrite "primary-instance"
+  active: false,          // Collision: should overwrite true
+  new_feature: "enabled", // New key: should be added
+  metadata: {
+    author: "Lead Dev",   // Deep Collision: should update "Admin"
+    tags: ["network"],    // Array Collision: will this overwrite or append?
+    stats: {
+      errors: 5           // Partial Deep Update: uptime should remain 99.9
+    }
+  },
+  connection_logs: [
+    { id: 3, type: "jitter", status: "high" } // New array item
+  ],
+  settings: {
+    notifications: {
+      push: true          // Deep Update: email should remain true
+    }
+  }
+};
+
+console.log(Utility.deepMerge(objectA,objectB))
 
 class UpStateError extends Error {
     constructor(message, code = "GENERAL_ERROR") {
@@ -111,7 +186,7 @@ class Result {
     iterateAsList(callBack) {
         const newArray = [];
         const currentList = this.list;
-        
+
         for (let i = 0; i < currentList.length; i++) {
             const newValue = callBack(i, currentList[i]);
             newArray.push(newValue ?? null);
@@ -189,11 +264,10 @@ class State extends EventTarget {
     constructor() {
         super();
 
-        // Restore persisted state from both storage drivers and merge them
         const sessionRaw = sessionStorage.getItem("UpState") || "{}";
         let sessionParsed;
         try {
-            sessionParsed = JSON.parse(sessionRaw);
+            sessionParsed = Utility.JSONHydrator(sessionRaw);
         } catch {
             sessionParsed = {};
         }
@@ -201,7 +275,7 @@ class State extends EventTarget {
         const permanentRaw = localStorage.getItem("UpState") || "{}";
         let permanentParsed;
         try {
-            permanentParsed = JSON.parse(permanentRaw);
+            permanentParsed = Utility.JSONHydrator(permanentRaw);
         } catch {
             permanentParsed = {};
         }
@@ -273,7 +347,7 @@ class State extends EventTarget {
             }
         }
 
-        // Config-level persistence overrides call-level persistence
+        // Call-level persistence takes priority — only fall back to config if no valid value was provided
         const markedForpersistence = this.#persistantCollections.find(obj => collection in obj);
 
         const persistenceValue = String(persistence).toLowerCase();
@@ -400,7 +474,6 @@ class State extends EventTarget {
                 detail: {
                     action: "batchSet",
                     count: arrayOfSetObjects.length,
-                    state: structuredClone(this.#state),
                     collections: [...new Set(collections)],
                     stateInputs
                 },
@@ -449,7 +522,6 @@ class State extends EventTarget {
                 detail: {
                     action: "batchRemove",
                     count: arrayOfRemoveRequests.length,
-                    state: structuredClone(this.#state),
                     collections: [...new Set(collections)],
                 },
                 cancelable: true,
