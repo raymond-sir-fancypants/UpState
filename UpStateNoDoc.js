@@ -117,7 +117,6 @@ const objectB = {
   }
 };
 
-console.log(Utility.deepMerge(objectA,objectB))
 
 class UpStateError extends Error {
     constructor(message, code = "GENERAL_ERROR") {
