@@ -1,87 +1,76 @@
 "use strict";
-
-// UpState version 1.2.0
+// UpState version 4.0.0
 
 /**
- * @class Utility
- * @description Internal helper class. Not part of the public API.
- * @private
+ * @fileoverview UpState — A lightweight, framework-agnostic client-side state manager.
+ * Supports deep/shallow/off cloning, session and permanent persistence,
+ * reactive subscriptions with bidirectional route propagation, and batch operations.
+ *
+ * @version 4.0.0
+ * @license MIT
+ *
+ * @example
+ * import UpState from './upstate.js';
+ *
+ * UpState.config({ cloning: 'deep' });
+ *
+ * UpState.set({ collection: 'user', state: { name: 'Alice' } });
+ * UpState.get('user').raw; // { name: 'Alice' }
  */
+
 class Utility {
 
     /**
-     * Parses a JSON string and automatically revives ISO 8601 date strings
-     * into native `Date` objects. This ensures that dates stored in
-     * `localStorage` or `sessionStorage` are restored as `Date` instances,
-     * not plain strings, when UpState loads on page start.
-     *
-     * Only strings that match the ISO 8601 format
-     * (`YYYY-MM-DDTHH:MM:SS...`) are converted. Other date-like strings
-     * (e.g. `"April 26, 2026"` or `"04-26-2026"`) are left as-is.
-     *
-     * If the JSON contains invalid syntax but the date reviver fails,
-     * it falls back to a plain `JSON.parse` without revival.
-     *
-     * @param {string} jsonString - The raw JSON string to parse.
-     * @returns {Object} The parsed object, with ISO date strings converted to `Date` instances.
-     *   Returns an empty object `{}` if the input is falsy.
-     *
-     * @example
-     * const result = Utility.JSONHydrator('{"created":"2026-04-26T09:15:00.000Z"}');
-     * result.created instanceof Date; // true
-     *
-     * @example
-     * // Non-ISO date strings are left alone
-     * const result = Utility.JSONHydrator('{"label":"April 26, 2026"}');
-     * typeof result.label; // "string"
+     * Parses a JSON string and automatically revives ISO 8601 date strings into Date objects.
+     * Falls back gracefully on malformed input.
+     * @param {string} jsonString - The JSON string to parse.
+     * @returns {object} The parsed object, or {} on failure.
      */
     static JSONHydrator(jsonString) {
-        const raw = jsonString;
+        if (!jsonString) return {};
 
-        if (!raw) return {};
+        const isoDateRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?(Z|[-+]\d{2}:\d{2})?$/;
 
         try {
-            return JSON.parse(raw, (k, v) => {
-                // Only revive strings that match the ISO 8601 datetime format
-                const isISO = typeof v === 'string' &&
-                    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(v);
-                return isISO ? new Date(v) : v;
+            return JSON.parse(jsonString, (key, value) => {
+                if (typeof value === 'string' && isoDateRegex.test(value)) {
+                    const potentialDate = new Date(value);
+                    return !isNaN(potentialDate.getTime()) ? potentialDate : value;
+                }
+                return value;
             });
         } catch (e) {
-            // Fallback: parse without date revival if the reviver throws
-            return JSON.parse(raw);
+            try {
+                return JSON.parse(jsonString);
+            } catch {
+                return {};
+            }
         }
     }
 
     /**
-     * Deeply merges two objects, with `source` values taking priority over
-     * `target`. Both inputs are cloned before merging
-     * so neither original is mutated.
-     *
-     * @param {Object} target - The base object.
-     * @param {Object} source - The object to merge into the target. Its values take priority.
-     * @returns {Object} A new deeply merged object.
-     *
-     * @example
-     * const a = { user: { name: "Alice", age: 30 } };
-     * const b = { user: { age: 31, role: "admin" } };
-     * Utility.deepMerge(a, b);
-     * // { user: { name: "Alice", age: 31, role: "admin" } }
+     * Recursively merges two objects or arrays. Arrays are concatenated.
+     * Objects are merged deeply. Primitive source values overwrite target values.
+     * @param {*} target - The base value.
+     * @param {*} source - The value to merge in.
+     * @returns {*} The merged result.
      */
     static deepMerge(target, source) {
-        const output = structuredClone(target);
-        source = structuredClone(source);
+        const isArray = Array.isArray(source);
+        const output = isArray ? (Array.isArray(target) ? [...target] : []) : { ...(target || {}) };
 
         for (const key in source) {
-            if (
-                source[key] &&
-                typeof source[key] === "object"
-            ) {
-                // Recursively merge nested objects
-                output[key] = this.deepMerge(output[key] || {}, source[key]);
-            } else {
-                // Primitives: source replaces target
-                output[key] = source[key];
+            if (Object.hasOwn(source, key)) {
+                const sVal = source[key];
+                const tVal = output[key];
+
+                if (Array.isArray(sVal) && Array.isArray(tVal)) {
+                    output[key] = [...tVal, ...sVal];
+                } else if (sVal && typeof sVal === "object" && !Array.isArray(sVal)) {
+                    output[key] = this.deepMerge(tVal || {}, sVal);
+                } else {
+                    output[key] = sVal;
+                }
             }
         }
 
@@ -89,67 +78,101 @@ class Utility {
     }
 
     /**
-     * Traverses the state tree to find the target location for a given route.
-     * Returns the parent object and the final key to act upon, so callers
-     * can read, write, or delete without re-traversing the tree.
+     * Traverses a dot/slash-separated route within a state object and returns
+     * the parent container and final key at the target path.
      *
-     * When `createPath` is `false`, the traversal operates on a clone of the
-     * state, leaving the original untouched (safe for reads). When `true`,
-     * it operates directly on the live state, creating missing nodes as it
-     * walks (required for writes).
+     * In read mode (`write = false`), returns a safe empty object if the path is broken.
+     * In write mode (`write = true`), creates missing path segments automatically.
      *
-     * @param {string} collection - The top-level state collection name.
-     * @param {string} route - Dot or slash separated path (e.g. `"user/profile"` or `"user.profile"`).
-     * @param {Object} state - The full state object to traverse.
-     * @param {boolean} [createPath=false] - If `true`, mutates `state` directly and
-     *   creates missing intermediate objects. If `false`, operates on a clone.
-     * @returns {{ targetParent: Object, targetKey: string }}
+     * @param {string} collection - The top-level collection key.
+     * @param {string} route - A dot or slash separated path e.g. `"user.profile.name"`.
+     * @param {object} state - The state object to traverse.
+     * @param {boolean} [write=false] - Whether to create missing path segments.
+     * @returns {{ targetParent: object, targetKey: string }}
      */
-    static getPathInfo(collection, route, state, createPath = false) {
+    static getPathInfo(collection, route, state, write = false) {
+        const routeArray = route.split(/[./]/);
+        const key = routeArray[routeArray.length - 1];
 
-        if (!createPath) {
-            state = structuredClone(state);
+        if (!Object.hasOwn(state, collection)) {
+            if (!write) return { targetParent: {}, targetKey: key };
+            state[collection] = {};
         }
 
-        if (!(collection in state)) state[collection] = {};
-
-        const routeArray = route.split(/[./]/); // Split by . or /
         let cursor = state[collection];
 
-        // Walk to the second-to-last segment, creating missing nodes if needed
         for (let i = 0; i < routeArray.length - 1; i++) {
             const part = routeArray[i];
-            if (!(part in cursor) || typeof cursor[part] !== 'object') {
+
+            if (!(part in cursor) || typeof cursor[part] !== 'object' || cursor[part] === null) {
+                if (!write) return { targetParent: {}, targetKey: key };
                 cursor[part] = {};
             }
+
             cursor = cursor[part];
         }
 
-        return {
-            targetParent: cursor,
-            targetKey: routeArray[routeArray.length - 1]
-        };
+        return { targetParent: cursor, targetKey: key };
+    }
+
+    /**
+     * Deep clones an object using `structuredClone`, with a manual fallback
+     * that strips functions and non-serialisable references.
+     *
+     * State should be plain data. If `structuredClone` fails the fallback
+     * silently removes non-cloneable values (functions, window references, etc.).
+     *
+     * @param {*} object - The value to clone.
+     * @param {WeakMap} [seen=new WeakMap()] - Used internally to handle circular references.
+     * @returns {*} A deep clone of the input.
+     */
+    static clone(object, seen = new WeakMap()) {
+        if (!object || typeof object !== "object") return object;
+
+        if (seen.has(object)) return seen.get(object);
+
+        try {
+            return structuredClone(object);
+        } catch (err) {
+            if (Array.isArray(object)) {
+                const newArr = [];
+                seen.set(object, newArr);
+                object.forEach((item, index) => { newArr[index] = this.clone(item, seen); });
+                return newArr;
+            }
+
+            const newObj = {};
+            seen.set(object, newObj);
+
+            for (const key in object) {
+                if (Object.prototype.hasOwnProperty.call(object, key)) {
+                    const val = object[key];
+                    if (typeof val !== 'function' && (typeof window === "undefined" || val !== window)) {
+                        newObj[key] = this.clone(val, seen);
+                    }
+                }
+            }
+            return newObj;
+        }
     }
 }
 
 /**
- * @class UpStateError
+ * Custom error class for UpState. Includes a `code` property for programmatic
+ * error handling.
+ *
  * @extends Error
- * @description Custom error class for UpState. Includes a `code` property for
- * programmatic error handling, so you can distinguish error types without
- * parsing the message string.
  *
  * @example
  * try {
- *   UpState.set({ collection: "", state: "test" });
+ *   UpState.set({ collection: '', state: 1 });
  * } catch (e) {
- *   if (e.code === "MISSING_COLLECTION_REF") {
- *     console.log("No collection provided");
+ *   if (e instanceof UpStateError) {
+ *     console.log(e.code); // "MISSING_COLLECTION_REF"
  *   }
  * }
  */
 class UpStateError extends Error {
-
     /**
      * @param {string} message - Human-readable error description.
      * @param {string} [code="GENERAL_ERROR"] - Machine-readable error code.
@@ -166,34 +189,23 @@ class UpStateError extends Error {
 }
 
 /**
- * @class Result
- * @description Wraps a value returned from a `get` or `batchGet` call.
- * Provides convenience getters and iteration methods to consume data without
- * extra boilerplate. All getters are null-safe — they never throw, even when
- * the underlying value is `null`.
- *
- * Result instances are **immutable**. The wrapped value is stored in a private
- * class field and the instance is frozen on construction — it cannot be
- * modified from outside the class.
+ * Immutable wrapper returned by all `get` operations and subscription callbacks.
+ * Provides safe accessors to handle null/undefined data without defensive checks.
  *
  * @example
- * const result = UpState.get("users");
- *
- * result.raw;   // The value as-is (or null)
- * result.list;  // Always an array
- * result.map;   // Always a plain object
+ * const result = UpState.get('user');
+ * result.raw;               // { name: 'Alice' } or null
+ * result.asArray;           // [{ name: 'Alice' }] or []
+ * result.asObject;          // { name: 'Alice' } or {}
+ * result.mapArray(v => v);  // mapped array
+ * result.mapObject(v => v); // mapped object
  */
 class Result {
 
-    /**
-     * The wrapped value. Private — access via `.raw`, `.list`, or `.map`.
-     * @type {*}
-     * @private
-     */
     #data;
 
     /**
-     * @param {*} input - The value to wrap. `undefined` and `null` are stored as `null`.
+     * @param {*} input - The raw value to wrap. `undefined` and `null` are normalised to `null`.
      */
     constructor(input) {
         this.#data = (input === undefined || input === null) ? null : input;
@@ -201,22 +213,20 @@ class Result {
     }
 
     /**
-     * The raw unwrapped value. Returns `null` if the value was missing.
+     * The raw underlying value. Returns `null` if no data was found.
      * @type {*}
      */
-    get raw() {
-        return this.#data;
-    }
+    get raw() { return this.#data; }
 
     /**
-     * The value as an array.
-     * - If already an array, returns it as-is.
-     * - If a plain object, returns its values via `Object.values()`.
-     * - If a primitive, wraps it in a single-item array.
-     * - If `null`, returns an empty array.
+     * Returns the data as an array.
+     * - Arrays are returned as-is.
+     * - Plain objects are converted to their values array.
+     * - Primitives are wrapped in a single-element array.
+     * - `null` returns `[]`.
      * @type {Array}
      */
-    get list() {
+    get asArray() {
         if (this.#data === null) return [];
         if (Array.isArray(this.#data)) return this.#data;
         if (typeof this.#data === "object" && Object.prototype.toString.call(this.#data) === '[object Object]') {
@@ -226,14 +236,14 @@ class Result {
     }
 
     /**
-     * The value as a plain object.
-     * - If already a plain object, returns it as-is.
-     * - If an array, converts to `{ 0: val, 1: val, ... }`.
-     * - If a primitive, returns `{ 0: value }`.
-     * - If `null`, returns an empty object.
-     * @type {Object}
+     * Returns the data as a plain object.
+     * - Plain objects are returned as-is.
+     * - Arrays are converted to index-keyed objects `{ 0: ..., 1: ... }`.
+     * - Primitives are wrapped as `{ 0: value }`.
+     * - `null` returns `{}`.
+     * @type {object}
      */
-    get map() {
+    get asObject() {
         if (this.#data === null) return {};
         if (typeof this.#data === "object" && !Array.isArray(this.#data)) return this.#data;
         if (Array.isArray(this.#data)) {
@@ -245,350 +255,635 @@ class Result {
     }
 
     /**
-     * Iterates over the value as a plain object, calling `callback` for each
-     * key-value pair and returning a **new** object with the transformed values.
-     * Does not mutate the `Result`. If the callback returns `undefined`, the
-     * key is set to `null` in the output.
-     *
-     * @param {function(key: string, value: *): *} callBack - Called with each `(key, value)` pair.
-     * @returns {Object} A new plain object with the transformed values.
-     *
-     * @example
-     * const prices = UpState.get("prices");
-     * // raw: { apple: 1.00, banana: 0.50 }
-     *
-     * const discounted = prices.iterateAsMap((key, value) => value * 0.9);
-     * // { apple: 0.9, banana: 0.45 }
+     * Maps over the data as an array, returning a new array.
+     * Null callback return values are coerced to `null`.
+     * @param {function(*, number): *} callback - Receives `(value, index)`.
+     * @returns {Array}
      */
-    iterateAsMap(callBack) {
-        const currentMap = this.map; // Call getter once to avoid repeated access
-        const keys = Object.keys(currentMap);
-        const newMap = {};
-
-        for (let i = 0; i < keys.length; i++) {
-            const key = keys[i];
-            const newValue = callBack(key, currentMap[key]);
-            newMap[key] = newValue ?? null;
+    mapArray(callback) {
+        const newArray = [];
+        const currentList = this.asArray;
+        for (let i = 0; i < currentList.length; i++) {
+            newArray.push(callback(currentList[i], i) ?? null);
         }
-        return newMap;
+        return newArray;
     }
 
     /**
-     * Iterates over the value as an array, calling `callback` for each item
-     * and returning a **new** array with the transformed values.
-     * Does not mutate the `Result`. If the callback returns `undefined`, the
-     * item is set to `null` in the output.
-     *
-     * @param {function(index: number, value: *): *} callBack - Called with each `(index, value)` pair.
-     * @returns {Array} A new array with the transformed values.
-     *
-     * @example
-     * const tags = UpState.get("tags");
-     * // raw: ["js", "css", "html"]
-     *
-     * const upper = tags.iterateAsList((i, value) => value.toUpperCase());
-     * // ["JS", "CSS", "HTML"]
+     * Maps over the data as an object, returning a new object with the same keys.
+     * Null callback return values are coerced to `null`.
+     * @param {function(*, string): *} callback - Receives `(value, key)`.
+     * @returns {object}
      */
-    iterateAsList(callBack) {
-        const currentList = this.list; // Cache to avoid repeated getter calls
-        const newArray = [];
-
-        for (let i = 0; i < currentList.length; i++) {
-            const newValue = callBack(i, currentList[i]);
-            newArray.push(newValue ?? null);
+    mapObject(callback) {
+        const currentMap = this.asObject;
+        const keys = Object.keys(currentMap);
+        const newMap = {};
+        for (let i = 0; i < keys.length; i++) {
+            newMap[keys[i]] = callback(currentMap[keys[i]], keys[i]) ?? null;
         }
-
-        return newArray;
+        return newMap;
     }
 }
 
 /**
- * @class StorageHandler
- * @description Handles reading and writing UpState data to `localStorage`
- * and `sessionStorage`. All state is stored under the single key `"UpState"`
- * to keep browser storage tidy. Not part of the public API.
+ * Internal handler for localStorage and sessionStorage.
+ * Maintains an in-memory `virtualLocalStorage` mirror to avoid redundant
+ * JSON parsing on every write.
  * @private
  */
 class StorageHandler {
 
-    /**
-     * Writes a value to the appropriate storage driver.
-     * Reads the existing stored state first and merges the new value in,
-     * so unrelated collections are never overwritten.
-     *
-     * @param {Object} options
-     * @param {string} options.collection - The collection name.
-     * @param {*} options.state - The value to persist.
-     * @param {string} [options.route] - Optional dot/slash path within the collection.
-     * @param {"session"|"permanent"} options.persistence - Which storage driver to use.
-     *   `"session"` → `sessionStorage`, `"permanent"` → `localStorage`.
-     */
-    static set({ collection, state, route, persistence }) {
+    constructor() {
+        const sessionRaw = sessionStorage.getItem("UpState") || "{}";
+        let sessionParsed;
+        try { sessionParsed = Utility.JSONHydrator(sessionRaw); }
+        catch { sessionParsed = {}; }
+
+        const permanentRaw = localStorage.getItem("UpState") || "{}";
+        let permanentParsed;
+        try { permanentParsed = Utility.JSONHydrator(permanentRaw); }
+        catch { permanentParsed = {}; }
+
+        this.virtualLocalStorage = { session: sessionParsed, permanent: permanentParsed };
+    }
+
+    set({ collection, state, route, persistence }) {
         const driver = (persistence === "session") ? sessionStorage : localStorage;
-
-        let localState;
-
-        try {
-            const localStateRaw = driver.getItem("UpState") || "{}";
-            localState = JSON.parse(localStateRaw);
-        } catch (e) {
-            console.warn("UpStorage: Corrupt JSON detected. Resetting storage.");
-            localState = {};
-        }
+        const localState = this.virtualLocalStorage[persistence] ?? {};
 
         if (!route) {
             localState[collection] = state;
         } else {
             const { targetParent, targetKey } = Utility.getPathInfo(collection, route, localState, true);
-            if (targetParent) {
-                targetParent[targetKey] = state;
-            }
+            if (targetParent) targetParent[targetKey] = state;
         }
 
+        this.virtualLocalStorage[persistence] = localState;
         driver.setItem("UpState", JSON.stringify(localState));
     }
 
-    /**
-     * Removes a value from **both** `localStorage` and `sessionStorage`.
-     * Both drivers are always cleared because a collection may have moved
-     * between them across `config()` calls or per-call persistence overrides.
-     *
-     * @param {string} collection - The collection name.
-     * @param {string} [route] - Optional dot/slash path within the collection.
-     *   If omitted, the entire collection is removed from storage.
-     */
-    static remove(collection, route) {
-        function remove(driver) {
-            let localState;
-
-            try {
-                const localStateRaw = driver.getItem("UpState") || "{}";
-                localState = JSON.parse(localStateRaw);
-            } catch (e) {
-                console.warn("UpStorage: Corrupt JSON detected. Resetting storage.");
-                localState = {};
-            }
+    remove(collection, route) {
+        const remove = (driver, virtualDriver) => {
+            const localState = this.virtualLocalStorage[virtualDriver] ?? {};
 
             if (!route) {
                 delete localState[collection];
             } else {
-                const { targetParent, targetKey } = Utility.getPathInfo(collection, route, localState, true);
-                if (targetParent) {
-                    delete targetParent[targetKey];
-                }
+                const { targetParent, targetKey } = Utility.getPathInfo(collection, route, localState, false);
+                if (targetParent) delete targetParent[targetKey];
             }
 
+            this.virtualLocalStorage[virtualDriver] = localState;
             driver.setItem("UpState", JSON.stringify(localState));
-        }
+        };
 
-        remove(localStorage);
-        remove(sessionStorage);
+        remove(localStorage, "permanent");
+        remove(sessionStorage, "session");
     }
 }
 
+const storageHandlerInstance = new StorageHandler();
+
 /**
- * @class State
+ * The core UpState class. Exported as a frozen singleton `UpState`.
+ * Extends `EventTarget` — listen to the `"update"` event for all state changes.
+ *
  * @extends EventTarget
- * @description The core UpState class. Manages an in-memory state tree with
- * optional persistence to `localStorage` or `sessionStorage`. Fires a
- * synchronous `update` event whenever state changes — by the time any listener
- * runs, the state is already updated and safe to read.
- *
- * On construction, any previously persisted state is automatically restored
- * from both storage drivers, merged together, and loaded with full date
- * hydration — ISO date strings are revived as native `Date` objects.
- *
- * ---
- *
- * **Recommended — call `config()` first:**
- * `config()` should ideally be the first call before any `set`, `get`, or
- * `remove` operations. As of v1.0.1+, calling it later is safe — any
- * collections already in state that match `persistantCollections` will be
- * persisted immediately when `config()` runs.
- *
- * ```js
- * // ✅ Recommended
- * UpState.config({ persistantCollections: [{ user: "permanent" }] });
- * UpState.set({ collection: "user", state: { name: "Alice" } });
- *
- * // ✅ Also valid — existing state is persisted when config() runs
- * UpState.set({ collection: "user", state: { name: "Alice" } });
- * UpState.config({ persistantCollections: [{ user: "permanent" }] });
- * ```
- *
- * ---
- *
- * **State is fully encapsulated:**
- * The internal state tree is a private class field (`#state`). It cannot be
- * read or modified from outside the class — the JS engine enforces this hard.
- * All access must go through the public methods.
- *
- * ```js
- * UpState.#state;      // SyntaxError — always
- * UpState.state = {};  // Silently ignored — Object.freeze blocks this
- * ```
- *
- * @fires State#update
+ * @hideconstructor
  */
 class State extends EventTarget {
 
-    /**
-     * The live in-memory state tree. Private — enforced by the JS engine.
-     * All reads and writes must go through the public methods.
-     * @type {Object}
-     * @private
-     */
-    #state = {};
-
-    /**
-     * Collections that should be automatically persisted to storage.
-     * Set via `config()`. Defaults to an empty array (no auto-persistence).
-     * @type {Array<Object>}
-     * @private
-     */
-    #persistantCollections = [];
-
-    /**
-     * Controls whether `update` events are fired on state changes.
-     * Set via `config()`. Defaults to `true`.
-     * @type {boolean}
-     * @private
-     */
+    #state = Object.create(null);
+    #persistentCollections = new Map();
     #allowEventDispatches = true;
+    #subscriptions = { collections: {}, callbacks: {} };
+    #unsubCallbacks = {};
+    #silenceWarnings = false;
+    #cloningOptions = { onSet: "deep", onGet: "deep", onSubscribe: "deep" };
 
     constructor() {
         super();
-
-        // Restore and hydrate persisted state from both storage drivers.
-        // JSONHydrator revives ISO date strings as native Date objects.
-        const sessionRaw = sessionStorage.getItem("UpState") || "{}";
-        let sessionParsed;
-        try {
-            sessionParsed = Utility.JSONHydrator(sessionRaw);
-        } catch {
-            sessionParsed = {};
-        }
-
-        const permanentRaw = localStorage.getItem("UpState") || "{}";
-        let permanentParsed;
-        try {
-            permanentParsed = Utility.JSONHydrator(permanentRaw);
-        } catch {
-            permanentParsed = {};
-        }
-
-        // Merge both sources — localStorage (permanent) takes priority over sessionStorage
-        this.#state = Utility.deepMerge(sessionParsed, permanentParsed);
+        this.#state = Utility.deepMerge(
+            storageHandlerInstance.virtualLocalStorage.permanent,
+            storageHandlerInstance.virtualLocalStorage.session,
+        );
     }
 
     /**
-     * Configures UpState behaviour.
+     * Configures UpState behaviour. Recommended to call before any other operations.
      *
-     * Calling `config()` first is recommended, but it is safe to call at any
-     * point. Any collections listed in `persistantCollections` that already
-     * exist in state will be persisted immediately when `config()` runs —
-     * no data is lost.
+     * @param {object} options
      *
-     * @param {Object} options
-     * @param {Array<Object>} [options.persistantCollections=[]] -
-     *   An array of objects mapping collection names to their persistence type.
-     *   Example: `[{ user: "permanent" }, { cart: "session" }]`
-     * @param {boolean} [options.allowEventDispatches=true] -
-     *   Set to `false` to disable all `update` events globally.
+     * @param {object} [options.persistentCollections={}]
+     *   Plain object mapping collection names to their persistence type.
+     *   - `"session"` — survives page refresh, cleared when the tab closes (sessionStorage).
+     *   - `"permanent"` — survives tab close (localStorage).
+     *   @example { user: "session", settings: "permanent" }
      *
-     * @throws {UpStateError} MISSING_CONFIG_ERR — if `persistantCollections` is not an array.
+     * @param {boolean} [options.allowEventDispatches=true]
+     *   Whether to dispatch `"update"` CustomEvents on state changes.
+     *
+     * @param {boolean} [options.silenceWarnings=false]
+     *   Suppresses internal console warnings.
+     *
+     * @param {"deep"|"shallow"|"off"|{onSet?: string, onGet?: string, onSubscribe?: string}} [options.cloning="deep"]
+     *   Controls how values are cloned on set, get, and subscribe callbacks.
+     *   Pass a string to apply one mode globally, or an object for per-operation control:
+     *   - `"deep"` — full structural clone via `structuredClone` (safest, default).
+     *   - `"shallow"` — top-level spread only (`{ ...obj }` / `[...arr]`).
+     *   - `"off"` — no cloning. Maximum performance; consumers share the internal reference.
+     *   @example { onSet: "deep", onGet: "shallow", onSubscribe: "off" }
+     *
+     * @throws {UpStateError} MISSING_CONFIG_ERR — if `persistentCollections` is an array or invalid.
+     * @throws {UpStateError} MISSING_CONFIG_ERR — if `cloning` contains an unrecognised value.
      *
      * @example
-     * // Recommended: call at the top of your app entry point
      * UpState.config({
-     *   persistantCollections: [{ user: "permanent" }, { cart: "session" }],
+     *   persistentCollections: { user: 'session', settings: 'permanent' },
+     *   cloning: 'deep',
      *   allowEventDispatches: true
      * });
-     *
-     * @example
-     * // Also valid: config after state exists — matching collections are persisted immediately
-     * UpState.set({ collection: "user", state: { name: "Alice" } });
-     * UpState.config({ persistantCollections: [{ user: "permanent" }] });
      */
     config({
-        persistantCollections = [],
+        persistentCollections = {},
         allowEventDispatches = true,
+        silenceWarnings = false,
+        cloning = "deep",
     }) {
         this.#allowEventDispatches = !!allowEventDispatches;
+        this.#silenceWarnings = !!silenceWarnings;
 
-        if (Array.isArray(persistantCollections)) {
-            // Sets collection-level persistence.
-            // Individual set() calls can override this for a single write.
-            this.#persistantCollections = persistantCollections;
+        const optionMap = new Set(["deep", "shallow", "off"]);
 
-            // Retroactively persist any collections already in state.
-            // Makes late config() calls safe — existing data is not lost.
-            this.#persistantCollections.forEach(collection => {
-                const key = Object.keys(collection)[0];
-
-                if (key in this.#state) {
-                    const persistence = collection[key];
-                    const state = this.#state[key];
-                    StorageHandler.set({ collection: key, state, persistence });
-                }
-            });
-
-        } else {
-            throw new UpStateError(
-                "persistantCollections should be an array of collection names",
+        if (typeof cloning === "string") {
+            if (optionMap.has(cloning)) {
+                this.#cloningOptions = { onSet: cloning, onGet: cloning, onSubscribe: cloning };
+            } else throw new UpStateError(
+                "'cloning' values can only either be 'deep', 'shallow' or 'off'",
                 "MISSING_CONFIG_ERR"
             );
+        } else {
+            for (const key in this.#cloningOptions) {
+                if (cloning[key] !== undefined) {
+                    if (!optionMap.has(cloning[key])) {
+                        throw new UpStateError(
+                            "'cloning' values can only either be 'deep', 'shallow' or 'off'",
+                            "MISSING_CONFIG_ERR"
+                        );
+                    }
+                    this.#cloningOptions[key] = cloning[key];
+                }
+            }
+        }
+
+        if (persistentCollections && !Array.isArray(persistentCollections) && persistentCollections !== undefined) {
+            for (const collectionKey in persistentCollections) {
+                const persistence = persistentCollections[collectionKey];
+                const state = this.#state[collectionKey];
+                if (state !== undefined) {
+                    this.#persistentCollections.set(collectionKey, persistence);
+                    storageHandlerInstance.set({ collection: collectionKey, state, persistence });
+                }
+            }
+        } else throw new UpStateError(
+            "'persistentCollections' value has to be an object mapping 'collection' to 'persistence' type",
+            "MISSING_CONFIG_ERR"
+        );
+    }
+
+    /**
+     * Writes a value to a collection, optionally at a nested route.
+     *
+     * Routes use dot or slash notation: `"user.profile.name"` or `"user/profile/name"`.
+     * Missing path segments are created automatically.
+     *
+     * By default (cloning: "deep") the input is deep-cloned before storage —
+     * mutating the original object after calling `set` will not affect stored state.
+     *
+     * @param {object} setObject
+     * @param {string} setObject.collection - The top-level collection name.
+     * @param {*} setObject.state - The value to store. Any type except `undefined`.
+     * @param {string} [setObject.route] - Dot/slash path to a nested property.
+     * @param {"session"|"permanent"} [setObject.persistence]
+     *   Persists this value to browser storage. Overrides collection-level config.
+     *
+     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is empty or missing.
+     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string.
+     * @throws {UpStateError} INVALID_STATE_VALUE — if `state` is `undefined`.
+     * @throws {UpStateError} INVALID_PERSISTENCE_VALUE — if `persistence` is an unrecognised string.
+     *
+     * @example
+     * // Set an entire collection
+     * UpState.set({ collection: 'user', state: { name: 'Alice', age: 30 } });
+     *
+     * // Set a nested property
+     * UpState.set({ collection: 'user', route: 'profile.name', state: 'Alice' });
+     *
+     * // Set with explicit persistence
+     * UpState.set({ collection: 'auth', state: { token: 'abc' }, persistence: 'session' });
+     *
+     * // Falsy values are valid
+     * UpState.set({ collection: 'flags', state: false });
+     * UpState.set({ collection: 'count', state: 0 });
+     */
+    set(setObject = {}) { this.#factorySet(setObject); }
+
+    /**
+     * Reads a value from a collection, optionally at a nested route.
+     * Always returns a {@link Result} — never throws on missing keys.
+     *
+     * @param {string} [collection] - The collection to read. Omit to get the entire state tree.
+     * @param {string} [route] - Dot/slash path to a nested property.
+     * @returns {Result}
+     *
+     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is an empty string.
+     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string.
+     *
+     * @example
+     * UpState.get('user').raw;                  // { name: 'Alice' } or null
+     * UpState.get('user', 'profile.name').raw;  // 'Alice' or null
+     * UpState.get('nonExistent').raw;           // null
+     * UpState.get('user').asArray;              // [{ name: 'Alice' }]
+     * UpState.get().raw;                        // entire state object
+     */
+    get(collection, route) {
+        if (collection === undefined) return new Result(this.#cloneValue(this.#state, this.#cloningOptions.onGet));
+
+        if (collection === "") throw new UpStateError("'collection' value has to be a String", "MISSING_COLLECTION_REF");
+        if (typeof collection !== "string") throw new UpStateError("'collection' value has to be a String", "INVALID_COLLECTION_REF");
+        if (!(collection in this.#state)) return new Result(null);
+        if (!route) return new Result(this.#cloneValue(this.#state[collection], this.#cloningOptions.onGet));
+
+        const { targetParent, targetKey } = Utility.getPathInfo(collection, route, this.#state);
+        const outputValue = targetParent?.[targetKey];
+        const output = (typeof outputValue === 'object' && outputValue !== null)
+            ? this.#cloneValue(outputValue, this.#cloningOptions.onGet)
+            : outputValue;
+
+        return new Result(output);
+    }
+
+    /**
+     * Removes a collection or a specific nested property from state and all storage.
+     *
+     * @param {string} collection - The collection to remove from.
+     * @param {string} [route] - Dot/slash path. Omit to remove the entire collection.
+     *
+     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is empty or missing.
+     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string.
+     *
+     * @example
+     * UpState.remove('user', 'profile.name'); // removes just the name property
+     * UpState.remove('user');                 // removes the entire user collection
+     */
+    remove(collection, route) { this.#factoryRemove(collection, route); }
+
+    /**
+     * Subscribes to state changes on a collection or a specific nested route.
+     *
+     * **Bidirectional propagation:** the callback fires when the subscribed path changes
+     * directly, when a parent path is updated, or when a child path changes.
+     * The callback always receives the current value **at the subscribed route**,
+     * regardless of where the change originated.
+     *
+     * If the subscribed value is removed, the callback receives `Result` with `.raw === null`.
+     *
+     * @param {object} options
+     * @param {string} options.collection - The collection to watch.
+     * @param {string} [options.route] - Dot/slash path. Omit to watch the entire collection.
+     * @param {function(Result): void} options.callback
+     *   Called with a {@link Result} wrapping the current value at the subscribed path.
+     * @param {string} [options.unsubscribeKey]
+     *   A named string key enabling unsubscription via {@link unsubscribe}.
+     *
+     * @returns {function} An unsubscribe function. Call it to remove this subscription.
+     *
+     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is empty or missing.
+     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string.
+     * @throws {UpStateError} MISSING_SUB_CALLBACK_REF — if `callback` is missing.
+     * @throws {UpStateError} INVALID_SUB_CALLBACK — if `callback` is not a function.
+     * @throws {UpStateError} INVALID_UNSUB_KEY — if `unsubscribeKey` is provided but not a string.
+     *
+     * @example
+     * // Basic collection subscription
+     * const unsub = UpState.subscribe({
+     *   collection: 'user',
+     *   callback: (result) => console.log(result.raw)
+     * });
+     * unsub(); // stop listening
+     *
+     * // Route-level subscription
+     * UpState.subscribe({
+     *   collection: 'user',
+     *   route: 'profile.name',
+     *   callback: (result) => console.log('Name changed to:', result.raw)
+     * });
+     *
+     * // Named key for later unsubscription
+     * UpState.subscribe({
+     *   collection: 'user',
+     *   callback: (result) => console.log(result.raw),
+     *   unsubscribeKey: 'userWatcher'
+     * });
+     * UpState.unsubscribe('userWatcher');
+     */
+    subscribe({ collection, route, callback, unsubscribeKey } = {}) {
+        if (collection === undefined || collection === "") {
+            throw new UpStateError("'collection' name is required", "MISSING_COLLECTION_REF");
+        }
+        if (typeof collection !== "string") {
+            throw new UpStateError("'collection' value has to be a String", "INVALID_COLLECTION_REF");
+        }
+        if (callback === undefined) {
+            throw new UpStateError("'subscription' callback is required", "MISSING_SUB_CALLBACK_REF");
+        }
+        if (typeof callback !== "function") {
+            throw new UpStateError("'subscription' callback has to be a function", "INVALID_SUB_CALLBACK");
+        }
+        if (typeof unsubscribeKey !== "string" && unsubscribeKey !== undefined) {
+            throw new UpStateError("'unsubscribeKey' value has to be a string", "INVALID_UNSUB_KEY");
+        }
+
+        route = route ?? "fireOnEntireCollection";
+
+        if (this.#subscriptions.collections[collection] === undefined)
+            this.#subscriptions.collections[collection] = new Map();
+
+        const splitRoute = route.split(/[./]/) || [];
+        this.#subscriptions.collections[collection].set(route, splitRoute);
+
+        if (this.#subscriptions.callbacks[collection] === undefined)
+            this.#subscriptions.callbacks[collection] = {};
+
+        if (!this.#subscriptions.callbacks[collection][route]) {
+            this.#subscriptions.callbacks[collection][route] = [];
+        }
+        this.#subscriptions.callbacks[collection][route].push(callback);
+
+        const unsub = () => {
+            const cbs = this.#subscriptions.callbacks[collection]?.[route];
+            if (!cbs) return;
+
+            this.#subscriptions.callbacks[collection][route] = cbs.filter(fn => fn !== callback);
+
+            if (this.#subscriptions.callbacks[collection][route].length === 0) {
+                this.#subscriptions.collections[collection]?.delete(route);
+            }
+
+            if (unsubscribeKey) delete this.#unsubCallbacks[unsubscribeKey];
+        };
+
+        if (unsubscribeKey) this.#unsubCallbacks[unsubscribeKey] = unsub;
+
+        return unsub;
+    }
+
+    /**
+     * Registers multiple subscriptions in a single call.
+     * Returns an array of unsubscribe functions in the same order as the input.
+     *
+     * @param {Array<object>} arrayOfSubscriptionObjects - Array of objects accepted by {@link subscribe}.
+     * @returns {function[]} Array of unsubscribe functions.
+     *
+     * @throws {UpStateError} INVALID_BATCH_SUB_ARGUMENT — if the argument is not an array.
+     *
+     * @example
+     * const [unsubUser, unsubTheme] = UpState.batchSubscriptions([
+     *   { collection: 'user', callback: (r) => console.log('user:', r.raw) },
+     *   { collection: 'settings', route: 'theme', callback: (r) => console.log('theme:', r.raw) }
+     * ]);
+     * unsubUser();
+     * unsubTheme();
+     */
+    batchSubscriptions(arrayOfSubscriptionObjects) {
+        if (!Array.isArray(arrayOfSubscriptionObjects)) {
+            throw new UpStateError(
+                "'batchSubscriptions' was expecting an array of objects meant for the subscribe method",
+                "INVALID_BATCH_SUB_ARGUMENT"
+            );
+        }
+        return arrayOfSubscriptionObjects.map(obj => this.subscribe(obj));
+    }
+
+    /**
+     * Unsubscribes one or more named subscriptions registered with `unsubscribeKey`.
+     *
+     * @param {string|string[]} keys - A key or array of keys to unsubscribe.
+     *
+     * @throws {UpStateError} INVALID_UNSUB_KEY — if a key is not a string or does not exist.
+     *
+     * @example
+     * UpState.unsubscribe('userWatcher');
+     * UpState.unsubscribe(['userWatcher', 'settingsWatcher']);
+     */
+    unsubscribe(keys) {
+        const unsubFunc = (key) => {
+            if (typeof key !== "string" && key !== undefined) {
+                throw new UpStateError("'unsubscribeKey' value has to be a string", "INVALID_UNSUB_KEY");
+            }
+            if (typeof key !== "string" || !this.#unsubCallbacks[key]) {
+                throw new UpStateError(`no subscription found for key "${key}"`, "INVALID_UNSUB_KEY");
+            }
+            this.#unsubCallbacks[key]();
+        };
+
+        if (Array.isArray(keys)) {
+            keys.forEach(key => unsubFunc(key));
+        } else {
+            unsubFunc(keys);
         }
     }
 
     /**
-     * Sets a value in the state tree. Optionally persists it to storage
-     * and fires a synchronous `update` event. The state is always fully
-     * updated before the event fires.
+     * Performs multiple `set` operations in a single batch.
+     * Subscription callbacks fire once per unique changed route after all sets complete.
+     * A single `"update"` event is dispatched when done.
      *
-     * **Persistence priority:** call-level `persistence` takes priority over
-     * config-level. If no valid call-level value is provided, the method falls
-     * back to whatever `persistantCollections` specifies for that collection.
+     * @param {Array<object>} arrayOfSetObjects - Array of objects accepted by {@link set}.
      *
-     * @param {Object} options
-     * @param {string} options.collection - The top-level collection to write to.
-     * @param {*} options.state - The value to store. Can be anything except `undefined`.
-     * @param {string} [options.route] - Dot or slash separated path within the collection
-     *   (e.g. `"profile/name"` or `"profile.name"`).
-     * @param {"session"|"permanent"} [options.persistence] - Persist to storage for this
-     *   call. Overrides config-level persistence if provided.
-     * @param {boolean} [dispatchUpdateEvent=true] - Whether to fire the `update` event.
-     *   Used internally by batch methods to suppress individual events.
-     *
-     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is missing or empty.
-     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string.
-     * @throws {UpStateError} INVALID_STATE_VALUE — if `state` is `undefined`.
-     * @throws {UpStateError} INVALID_PERSISTENCE_VALUE — if `persistence` is not `"session"` or `"permanent"`.
+     * @throws {UpStateError} INVALID_BATCH_SET_ARGUMENT — if the argument is not an array.
      *
      * @example
-     * UpState.set({ collection: "user", state: { name: "Alice" } });
-     * UpState.set({ collection: "user", route: "profile/age", state: 30 });
-     *
-     * // Override config-level persistence for this call only
-     * UpState.set({ collection: "cache", state: {}, persistence: "session" });
+     * UpState.batchSet([
+     *   { collection: 'user', route: 'name', state: 'Alice' },
+     *   { collection: 'user', route: 'age', state: 30 },
+     *   { collection: 'settings', state: { theme: 'dark' } }
+     * ]);
      */
-    set({ collection, state, route, persistence }, dispatchUpdateEvent = true) {
-
-        if (collection === undefined || collection === "") {
-            throw new UpStateError("collection name is required", "MISSING_COLLECTION_REF");
+    batchSet(arrayOfSetObjects) {
+        if (!Array.isArray(arrayOfSetObjects)) {
+            throw new UpStateError(
+                "was expecting an array of objects meant for the UpState.set method",
+                "INVALID_BATCH_SET_ARGUMENT"
+            );
         }
 
-        if (typeof collection !== "string") {
-            throw new UpStateError("collection can only be a String", "INVALID_COLLECTION_REF");
+        const changedRoutes = new Map();
+
+        arrayOfSetObjects.forEach(setObject => {
+            this.#factorySet(setObject, { fireSubscriptionCallbacks: false, dispatchUpdateEvent: false });
+
+            if (!changedRoutes.has(setObject.collection)) changedRoutes.set(setObject.collection, new Set());
+            changedRoutes.get(setObject.collection).add(setObject.route || "fireOnEntireCollection");
+        });
+
+        changedRoutes.forEach((routes, collection) => {
+            routes.forEach(route => {
+                if (route) this.#fireSubscriptionCallbacks(collection, route);
+            });
+        });
+
+        if (this.#allowEventDispatches) {
+            this.dispatchEvent(new CustomEvent("update", {
+                detail: { action: "batchSet", count: arrayOfSetObjects.length, routeMap: changedRoutes },
+                cancelable: true,
+            }));
+        }
+    }
+
+    /**
+     * Retrieves multiple values in a single call.
+     * Returns a {@link Result} wrapping a plain object keyed by collection,
+     * each containing an array of retrieved values in request order.
+     *
+     * @param {Array<{collection: string, route?: string}>} arrayOfGetRequests
+     * @returns {Result}
+     *
+     * @throws {UpStateError} INVALID_BATCH_GET_ARGUMENT — if the argument is not an array.
+     *
+     * @example
+     * const result = UpState.batchGet([
+     *   { collection: 'user', route: 'name' },
+     *   { collection: 'user', route: 'age' },
+     *   { collection: 'settings' }
+     * ]);
+     * result.raw; // { user: ['Alice', 30], settings: [{ theme: 'dark' }] }
+     */
+    batchGet(arrayOfGetRequests) {
+        if (!Array.isArray(arrayOfGetRequests)) {
+            throw new UpStateError(
+                "'batchGet' expects an array of objects meant for the 'get' method",
+                "INVALID_BATCH_GET_ARGUMENT"
+            );
         }
 
-        // Avoid if(!state) — it would incorrectly reject 0, false, [], etc.
-        if (state === undefined) {
-            throw new UpStateError("state value cannot be 'undefined'", "INVALID_STATE_VALUE");
+        const data = {};
+
+        arrayOfGetRequests.forEach(req => {
+            if (!data[req.collection]) data[req.collection] = [];
+            data[req.collection].push(this.get(req.collection, req.route).raw);
+        });
+
+        return new Result(data);
+    }
+
+    /**
+     * Removes multiple collections or nested properties in a single batch.
+     * Subscription callbacks fire once per unique collection after all removals.
+     * A single `"update"` event is dispatched when done.
+     *
+     * @param {Array<{collection: string, route?: string}>} arrayOfRemoveRequests
+     *
+     * @throws {UpStateError} INVALID_BATCH_REMOVE_ARGUMENT — if the argument is not an array.
+     *
+     * @example
+     * UpState.batchRemove([
+     *   { collection: 'user', route: 'token' },
+     *   { collection: 'cache' }
+     * ]);
+     */
+    batchRemove(arrayOfRemoveRequests) {
+        if (!Array.isArray(arrayOfRemoveRequests)) {
+            throw new UpStateError(
+                "'batchRemove' was expecting an array of objects meant for the 'remove' method",
+                "INVALID_BATCH_REMOVE_ARGUMENT"
+            );
         }
+
+        const collections = [];
+        arrayOfRemoveRequests.forEach(removeObject => {
+            this.#factoryRemove(removeObject.collection, removeObject.route, {
+                dispatchUpdateEvent: false,
+                fireSubscriptionCallbacks: false
+            });
+            collections.push(removeObject.collection);
+        });
+
+        const collectionSet = [...new Set(collections)];
+        collectionSet.forEach(collection => this.#fireSubscriptionCallbacks(collection));
+
+        if (this.#allowEventDispatches) {
+            this.dispatchEvent(new CustomEvent("update", {
+                detail: { action: "batchRemove", count: arrayOfRemoveRequests.length, collections: collectionSet },
+                cancelable: true,
+            }));
+        }
+    }
+
+    // ─── Private ─────────────────────────────────────────────────────────────
+
+    /** @private */
+    #cloneValue(value, mode) {
+        if (!value || typeof value !== "object") return value;
+        switch (mode) {
+            case "off": return value;
+            case "shallow": return Array.isArray(value) ? [...value] : { ...value };
+            default: return Utility.clone(value);
+        }
+    }
+
+    /** @private */
+    #fireSubscriptionCallbacks(collection, changedPath, skipCollectionLevel = false) {
+        const subs = this.#subscriptions.collections[collection];
+        if (!subs) return;
+
+        const route = changedPath?.split(/[./]/) || [];
+
+        for (const [key, value] of subs) {
+            const subRoute = value || [];
+            const shorter = Math.min(route.length, subRoute.length);
+            let compare = true;
+
+            for (let i = 0; i < shorter; i++) {
+                if (route[i] !== subRoute[i]) { compare = false; break; }
+            }
+
+            if (key === "fireOnEntireCollection") {
+                if (skipCollectionLevel) continue;
+                const cbs = this.#subscriptions.callbacks[collection][key];
+                if (Array.isArray(cbs)) {
+                    cbs.forEach(cb => {
+                        if (typeof cb === 'function') {
+                            cb(new Result(this.#cloneValue(this.#state[collection], this.#cloningOptions.onSubscribe)));
+                        }
+                    });
+                }
+            } else if (compare) {
+                const destination = Utility.getPathInfo(collection, key, this.#state, false);
+                const actualValue = destination?.targetParent?.[destination.targetKey];
+                const cbs = this.#subscriptions.callbacks[collection][key];
+                if (Array.isArray(cbs)) {
+                    cbs.forEach(cb => {
+                        if (typeof cb === 'function') {
+                            cb(new Result(this.#cloneValue(actualValue, this.#cloningOptions.onSubscribe)));
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /** @private */
+    #factorySet({ collection, state, route, persistence }, { fireSubscriptionCallbacks = true, dispatchUpdateEvent = true } = {}) {
+        fireSubscriptionCallbacks = !!fireSubscriptionCallbacks;
+
+        if (collection === undefined || collection === "") throw new UpStateError("'collection' value has to be a String", "MISSING_COLLECTION_REF");
+        if (typeof collection !== "string") throw new UpStateError("'collection' can only be a String", "INVALID_COLLECTION_REF");
+        if (state === undefined) throw new UpStateError("state value cannot be undefined", "INVALID_STATE_VALUE");
 
         state = (typeof state === 'object' && state !== null)
-            ? structuredClone(state)
+            ? this.#cloneValue(state, this.#cloningOptions.onSet)
             : state;
 
         const destination = {};
@@ -597,49 +892,33 @@ class State extends EventTarget {
             this.#state[collection] = state;
             destination.targetParent = this.#state;
             destination.targetKey = collection;
+            if (fireSubscriptionCallbacks) this.#fireSubscriptionCallbacks(collection);
         } else {
             const { targetParent, targetKey } = Utility.getPathInfo(collection, route, this.#state, true);
             destination.targetParent = targetParent;
             destination.targetKey = targetKey;
             if (targetParent) {
                 targetParent[targetKey] = state;
+                if (fireSubscriptionCallbacks) this.#fireSubscriptionCallbacks(collection, route);
             }
         }
 
-        // Call-level persistence takes priority — only fall back to config if no valid value was provided
-        const markedForPersistence = this.#persistantCollections.find(obj => collection in obj);
-        const persistenceValue = String(persistence).toLowerCase();
-
-        if (markedForPersistence && !(persistenceValue === "permanent" || persistenceValue === "session")) {
-            persistence = markedForPersistence[collection];
+        if (typeof persistence !== "string" && persistence !== undefined) {
+            throw new UpStateError("'persistence' can only be a string", "INVALID_PERSISTENCE_VALUE");
         }
 
+        persistence = persistence ?? this.#persistentCollections.get(collection);
+
         if (persistence) {
-            const resolvedPersistence = String(persistence).toLowerCase();
-            if (resolvedPersistence === "permanent" || resolvedPersistence === "session") {
-                StorageHandler.set({ collection, state, route, persistence });
+            const pv = String(persistence).toLowerCase();
+            if (pv === "permanent" || pv === "session") {
+                storageHandlerInstance.set({ collection, state, route, persistence });
             } else {
-                throw new UpStateError(
-                    "invalid persistence value; it can only be 'session' or 'permanent'",
-                    "INVALID_PERSISTENCE_VALUE"
-                );
+                throw new UpStateError("'persistence' value can only be either 'session' or 'permanent'", "INVALID_PERSISTENCE_VALUE");
             }
         }
 
         if (dispatchUpdateEvent && this.#allowEventDispatches) {
-            /**
-             * Fired synchronously after any state change. By the time this fires,
-             * the state tree is already updated — calling `UpState.get()` inside
-             * a listener will always return the new value.
-             *
-             * @event State#update
-             * @type {CustomEvent}
-             * @property {"set"|"remove"|"batchSet"|"batchRemove"} detail.action - What triggered the event.
-             * @property {string} detail.collection - The affected collection.
-             * @property {string} [detail.route] - The route within the collection, if any.
-             * @property {*} detail.state - The value that was set, or the parent object after a removal.
-             * @property {Object} detail.destination - `{ targetParent, targetKey }` of the affected node.
-             */
             this.dispatchEvent(new CustomEvent("update", {
                 detail: { collection, route, destination, state, action: "set" },
                 cancelable: true,
@@ -647,81 +926,12 @@ class State extends EventTarget {
         }
     }
 
-    /**
-     * Retrieves a value from the state tree. Never throws on missing data —
-     * returns a `Result` wrapping `null` instead.
-     *
-     * Calling `get()` with no arguments returns a full deep clone of the
-     * entire state tree. Passing an empty string throws, as that is likely
-     * a mistake rather than intentional.
-     *
-     * @param {string} [collection] - The collection to read from.
-     *   Omit entirely to get a snapshot of the full state tree.
-     * @param {string} [route] - Dot or slash separated path within the collection.
-     * @returns {Result} A `Result` wrapping the value.
-     *
-     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is an empty string.
-     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string (and not `undefined`).
-     *
-     * @example
-     * const user    = UpState.get("user").raw;
-     * const name    = UpState.get("user", "profile/name").raw;
-     * const allData = UpState.get().raw; // full state snapshot
-     */
-    get(collection, route) {
+    /** @private */
+    #factoryRemove(collection, route, { dispatchUpdateEvent = true, fireSubscriptionCallbacks = true } = {}) {
+        fireSubscriptionCallbacks = !!fireSubscriptionCallbacks;
 
-        // No collection — return a full deep clone of the entire state tree
-        if (collection === undefined) return new Result(structuredClone(this.#state));
-
-        // Empty string is likely a mistake — throw rather than silently returning all state
-        if (collection === "") {
-            throw new UpStateError("collection name is required", "MISSING_COLLECTION_REF");
-        }
-
-        if (typeof collection !== "string") {
-            throw new UpStateError("collection can only be a String", "INVALID_COLLECTION_REF");
-        }
-
-        if (!(collection in this.#state)) return new Result(null);
-
-        if (!route) return new Result(this.#state[collection]);
-
-        const { targetParent, targetKey } = Utility.getPathInfo(collection, route, this.#state);
-        const outputValue = targetParent[targetKey];
-        const output = (typeof outputValue === 'object' && outputValue !== null)
-            ? structuredClone(outputValue)
-            : outputValue;
-
-        return new Result(output);
-    }
-
-    /**
-     * Removes a value from the state tree and from both storage drivers.
-     * Fires a synchronous `update` event unless suppressed.
-     *
-     * @param {string} collection - The collection to remove from.
-     * @param {string} [route] - Dot or slash separated path within the collection.
-     *   If omitted, the entire collection is removed.
-     * @param {boolean} [dispatchUpdateEvent=true] - Whether to fire the `update` event.
-     *   Used internally by `batchRemove` to suppress individual events.
-     * @returns {Object} The parent object after the deletion.
-     *
-     * @throws {UpStateError} MISSING_COLLECTION_REF — if `collection` is missing or empty.
-     * @throws {UpStateError} INVALID_COLLECTION_REF — if `collection` is not a string.
-     *
-     * @example
-     * UpState.remove("user");                    // removes the entire collection
-     * UpState.remove("user", "profile/age");     // removes a specific nested value
-     */
-    remove(collection, route, dispatchUpdateEvent = true) {
-
-        if (collection === undefined || collection === "") {
-            throw new UpStateError("collection name is required", "MISSING_COLLECTION_REF");
-        }
-
-        if (typeof collection !== "string") {
-            throw new UpStateError("collection can only be a String", "INVALID_COLLECTION_REF");
-        }
+        if (collection === undefined || collection === "") throw new UpStateError("'collection' value has to be a String", "MISSING_COLLECTION_REF");
+        if (typeof collection !== "string") throw new UpStateError("'collection' value has to be a String", "INVALID_COLLECTION_REF");
 
         const destination = {};
 
@@ -729,165 +939,27 @@ class State extends EventTarget {
             destination.targetParent = this.#state;
             destination.targetKey = collection;
             delete this.#state[collection];
+            if (fireSubscriptionCallbacks) this.#fireSubscriptionCallbacks(collection);
         } else {
             const { targetParent, targetKey } = Utility.getPathInfo(collection, route, this.#state, false);
             destination.targetParent = targetParent;
             destination.targetKey = targetKey;
             if (targetParent && targetKey in targetParent) {
                 delete targetParent[targetKey];
+                if (fireSubscriptionCallbacks) this.#fireSubscriptionCallbacks(collection, route);
             }
         }
 
-        StorageHandler.remove(collection, route);
+        storageHandlerInstance.remove(collection, route);
 
         if (dispatchUpdateEvent && this.#allowEventDispatches) {
             this.dispatchEvent(new CustomEvent("update", {
-                detail: {
-                    collection, route, destination,
-                    state: destination.targetParent,
-                    action: "remove"
-                },
+                detail: { collection, route, destination, state: destination.targetParent, action: "remove" },
                 cancelable: true,
             }));
         }
 
         return destination.targetParent;
-    }
-
-    /**
-     * Sets multiple state values in a single operation. Each individual write
-     * happens silently (no event per write), then a single `update` event is
-     * fired once all writes are complete.
-     *
-     * @param {Array<Object>} arrayOfSetObjects - An array of option objects,
-     *   each matching the signature of `set()`.
-     *
-     * @throws {UpStateError} INVALID_BATCH_SET_ARGUMENT — if the argument is not an array.
-     *
-     * @example
-     * UpState.batchSet([
-     *   { collection: "user", state: { name: "Alice" } },
-     *   { collection: "settings", route: "theme", state: "dark" }
-     * ]);
-     */
-    batchSet(arrayOfSetObjects) {
-        if (!Array.isArray(arrayOfSetObjects)) {
-            throw new UpStateError(
-                "was expecting an array of objects meant for the Upstate.set method",
-                "INVALID_BATCH_SET_ARGUMENT"
-            );
-        }
-
-        const collections = [];
-        const stateInputs = {};
-
-        arrayOfSetObjects.forEach(setObject => {
-            this.set(setObject, false); // suppress individual events
-
-            if (!stateInputs[setObject.collection]) {
-                stateInputs[setObject.collection] = [];
-            }
-
-            const logState = (typeof setObject.state === "object")
-                ? structuredClone(setObject.state)
-                : setObject.state;
-
-            stateInputs[setObject.collection].push(logState);
-            collections.push(setObject.collection);
-        });
-
-        if (this.#allowEventDispatches) {
-            this.dispatchEvent(new CustomEvent("update", {
-                detail: {
-                    action: "batchSet",
-                    count: arrayOfSetObjects.length,
-                    collections: [...new Set(collections)],
-                    stateInputs
-                },
-                cancelable: true,
-            }));
-        }
-    }
-
-    /**
-     * Retrieves multiple values in a single call. Returns a `Result` wrapping
-     * an object keyed by collection name, where each value is an array of raw
-     * results for that collection.
-     *
-     * Does not fire an `update` event — reads are always silent.
-     *
-     * @param {Array<{ collection: string, route?: string }>} arrayOfGetRequests
-     * @returns {Result} A `Result` wrapping `{ [collection]: rawValue[] }`.
-     *
-     * @throws {UpStateError} INVALID_BATCH_GET_ARGUMENT — if the argument is not an array.
-     *
-     * @example
-     * const result = UpState.batchGet([
-     *   { collection: "user" },
-     *   { collection: "user", route: "profile/name" }
-     * ]);
-     * result.raw; // { user: [ { name: "Alice", ... }, "Alice" ] }
-     */
-    batchGet(arrayOfGetRequests) {
-        if (!Array.isArray(arrayOfGetRequests)) {
-            throw new UpStateError(
-                "batchGet expects an array of objects",
-                "INVALID_BATCH_GET_ARGUMENT"
-            );
-        }
-
-        const data = {};
-
-        arrayOfGetRequests.forEach(req => {
-            if (!data[req.collection]) {
-                data[req.collection] = [];
-            }
-            data[req.collection].push(this.get(req.collection, req.route).raw);
-        });
-
-        return new Result(data);
-    }
-
-    /**
-     * Removes multiple values in a single operation. Each individual removal
-     * happens silently (no event per removal), then a single `update` event
-     * is fired once all removals are complete.
-     *
-     * @param {Array<{ collection: string, route?: string }>} arrayOfRemoveRequests
-     *
-     * @throws {UpStateError} INVALID_BATCH_REMOVE_ARGUMENT — if the argument is not an array.
-     *
-     * @example
-     * UpState.batchRemove([
-     *   { collection: "user", route: "profile/age" },
-     *   { collection: "cart" }
-     * ]);
-     */
-    batchRemove(arrayOfRemoveRequests) {
-        if (!Array.isArray(arrayOfRemoveRequests)) {
-            throw new UpStateError(
-                "was expecting an array of objects meant for the Upstate.remove method",
-                "INVALID_BATCH_REMOVE_ARGUMENT"
-            );
-        }
-
-        const collections = [];
-
-        arrayOfRemoveRequests.forEach(removeObject => {
-            this.remove(removeObject.collection, removeObject.route, false); // suppress individual events
-            collections.push(removeObject.collection);
-        });
-
-        if (this.#allowEventDispatches) {
-            this.dispatchEvent(new CustomEvent("update", {
-                detail: {
-                    action: "batchRemove",
-                    count: arrayOfRemoveRequests.length,
-                    collections: [...new Set(collections)],
-                },
-                cancelable: true,
-            }));
-        }
     }
 }
 
