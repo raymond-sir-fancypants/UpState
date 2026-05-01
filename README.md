@@ -1,15 +1,33 @@
 # UpState
 
-A lightweight, framework-agnostic client-side state manager for vanilla JavaScript.
+A lightweight, dependency-free JavaScript state management library for the browser.
+
+UpState gives you a simple, predictable way to manage application state — with optional persistence to `localStorage` or `sessionStorage`, reactive subscriptions at any depth of your state tree, and safe result handling that never throws on missing data.
 
 No dependencies. No build step. Just import and go.
-
 ```js
 import UpState from './upstate.js';
 
 UpState.set({ collection: 'user', state: { name: 'Alice' } });
 UpState.get('user').raw; // { name: 'Alice' }
 ```
+
+---
+
+## Features
+
+- 📦 Zero dependencies
+- 🔒 Fully encapsulated state — enforced by private class fields
+- 🧠 In-memory state tree with optional persistence
+- 🔔 Granular subscriptions — subscribe to a whole collection or a specific nested route
+- 🔑 Named unsubscribe keys — clean up listeners from anywhere without holding a reference
+- 🔁 Event-driven — listen for any state change via the `update` event
+- 🛡️ Safe `Result` wrapper — never throws on missing data, with `.asArray`, `.asObject`, `.mapArray` and `.mapObject` helpers
+- 📂 Nested state support via dot or slash routes (`"user/profile/name"`)
+- ⚡ Batch operations — `batchSet`, `batchGet`, `batchRemove` and `batchSubscriptions` for efficient multi-value operations
+- 💾 Two-tier persistence — store state as `"session"` (sessionStorage) or `"permanent"` (localStorage), per collection or per write
+- 📅 Auto date hydration — ISO 8601 strings are automatically revived as `Date` objects on load
+- 🧬 Configurable cloning — choose `"deep"`, `"shallow"`, or `"off"` globally or individually for get, set, and subscribe operations
 
 ---
 
@@ -26,7 +44,6 @@ Requires: ES2022 private class fields, `structuredClone`, `EventTarget`, `localS
 
 > UpState includes a manual deep-clone fallback if `structuredClone` fails, so it degrades gracefully with a polyfill for older targets.
 
----
 
 ## Installation
 
