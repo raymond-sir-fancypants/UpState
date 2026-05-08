@@ -1,5 +1,7 @@
 "use strict";
-// UpState version 4.0.0
+// UpState version 4.2.0
+
+const FIREONENTIRECOLLECTION = Symbol("fireOnEntireCollection");
 
 class Utility {
 
@@ -285,17 +287,19 @@ class State extends EventTarget {
     #state = Object.create(null);
 
     #persistentCollections = new Map();
+    #killResponseRegistry = new Map();
+    #killRequestRegistry = new Map();
+    #requestDetailCache = new Map();
+    #killEmitRegistry = new Map();
+    #splitRouteCache = new Map();
+    #unsubCallbacks = new Map();
+    #subscriptions = new Map();
+    #ttlTimeout = new Map();
 
     #allowEventDispatches = true;
-
-    #subscriptions = {
-        collections: {},
-        callbacks: {}
-    };
-
-    #unsubCallbacks = {};
-
     #silenceWarnings = false;
+
+    #bus = new EventTarget();
 
     #cloningOptions = {
         onSet: "deep",
@@ -309,6 +313,10 @@ class State extends EventTarget {
             storageHandlerInstance.virtualLocalStorage.permanent,
             storageHandlerInstance.virtualLocalStorage.session,
         );
+
+        this.on = this.addEventListener.bind(this);
+        this.off = this.removeEventListener.bind(this);
+        this.emit = this.dispatchEvent.bind(this);
     }
 
     config({
@@ -334,7 +342,7 @@ class State extends EventTarget {
 
             } else throw new UpStateError(
                 "'cloning' values can only either be 'deep', 'shallow' or 'off'",
-                "MISSING_CONFIG_ERR"
+                "MISSING_ARG"
             );
 
         } else {
@@ -345,7 +353,7 @@ class State extends EventTarget {
                     if (!optionMap.has(cloning[key])) {
                         throw new UpStateError(
                             "'cloning' values can only either be 'deep', 'shallow' or 'off'",
-                            "MISSING_CONFIG_ERR"
+                            "MISSING_ARG"
                         );
                     }
                     this.#cloningOptions[key] = cloning[key];
@@ -365,67 +373,102 @@ class State extends EventTarget {
             }
         } else throw new UpStateError(
             "'persistentCollections' value has to be an object mapping 'collection' to 'persistence' type",
-            "MISSING_CONFIG_ERR"
+            "MISSING_ARG"
         );
     }
 
-    subscribe({ collection, route, callback, unsubscribeKey } = {}) {
+    subscribe({ collection, route, callback, key, propagation = "none" } = {}) {
+        const propagationOptions = new Set(["none", "both", "up", "down"]);
+        const publicPropagationOptions = new Set(["exact", "related", "ancestors", "descendants"]);
+
+        switch (propagation) {
+            case "exact": propagation = "none"; break;
+            case "related": propagation = "both"; break;
+            case "ancestors": propagation = "up"; break;
+            case "descendants": propagation = "down"; break;
+        }
+
+        if (!propagationOptions.has(propagation)) {
+            throw new UpStateError(
+                `'propagation' must be one of: ${[...publicPropagationOptions].join(", ")}`,
+                "INVALID_ARG"
+            );
+        }
 
         if (collection === undefined || collection === "") {
-            throw new UpStateError("'collection' name is required", "MISSING_COLLECTION_REF");
+            throw new UpStateError("'collection' name is required", "MISSING_ARG");
         }
 
         if (typeof collection !== "string") {
-            throw new UpStateError("'collection' value has to be be a String", "INVALID_COLLECTION_REF");
+            throw new UpStateError("'collection' value has to be be a String", "INVALID_ARG");
         }
 
         if (callback === undefined) {
-            throw new UpStateError("'subscription' callback is required", "MISSING_SUB_Callback_REF");
+            throw new UpStateError("'subscription' callback is required", "MISSING_ARG");
         }
 
         if (typeof callback !== "function") {
-            throw new UpStateError("'subscription' callback has to be a function", "INVALID_SUB_Callback");
+            throw new UpStateError("'subscription' callback has to be a function", "INVALID_ARG");
         }
 
-        if (typeof unsubscribeKey !== "string" && unsubscribeKey !== undefined) {
-            throw new UpStateError("'unsubscribeKey' value has to be a string", "INVALID_UNSUB_KEY");
+        if (key === undefined) {
+            throw new UpStateError("'key' is required", "MISSING_ARG");
         }
 
-        route = route ?? "fireOnEntireCollection";
-
-        // console.log(route)
-
-        if (this.#subscriptions.collections[collection] === undefined)
-            this.#subscriptions.collections[collection] = new Map();
-
-        const splitRoute = route.split(/[./]/) || [];
-        this.#subscriptions.collections[collection].set(route, splitRoute);
-
-        if (this.#subscriptions.callbacks[collection] === undefined)
-            this.#subscriptions.callbacks[collection] = {};
-
-        if (!this.#subscriptions.callbacks[collection][route]) {
-            this.#subscriptions.callbacks[collection][route] = [];
+        if (typeof key !== "string") {
+            throw new UpStateError("'key' value has to be a string", "INVALID_ARG");
         }
-        this.#subscriptions.callbacks[collection][route].push(callback);
+
+        if (this.#unsubCallbacks.has(key)) {
+            throw new UpStateError("the 'key' entered is already in use", "INVALID_ARG");
+        }
+
+        route = route ?? FIREONENTIRECOLLECTION;
+
+        if (!this.#subscriptions.has(collection)) {
+            this.#subscriptions.set(collection, new Map());
+        }
+
+        const routeMap = this.#subscriptions.get(collection);
+
+        if (!routeMap.has(route)) {
+            const subObj = {
+                splitRoute: (route === FIREONENTIRECOLLECTION)
+                    ? [] : route.split(/[./]/),
+
+                routeNode: new Map(),
+            }
+            routeMap.set(route, subObj);
+        }
+
+        const subscriptionObj = routeMap.get(route);
+
+        const routeNode = Object.freeze({
+            route,
+            propagation,
+            callback,
+            key
+        });
+
+        subscriptionObj.routeNode.set(key, routeNode);
+
+        const callbackMap = subscriptionObj.routeNode;
 
         const unsub = () => {
-            const cbs = this.#subscriptions.callbacks[collection]?.[route];
-            if (!cbs) return;
+            if (callbackMap.size <= 1) {
 
-            this.#subscriptions.callbacks[collection][route] = cbs.filter(fn => fn !== callback);
+                routeMap.delete(route);
 
-            // Only remove the route from the Set when no callbacks remain
-            if (this.#subscriptions.callbacks[collection][route].length === 0) {
-                this.#subscriptions.collections[collection]?.delete(route);
+                if (routeMap.size === 0) this.#subscriptions.delete(collection);
+
+            } else {
+                callbackMap.delete(key);
             }
 
-            if (unsubscribeKey) delete this.#unsubCallbacks[unsubscribeKey]
+            this.#unsubCallbacks.delete(key);
         }
 
-        if (unsubscribeKey) {
-            this.#unsubCallbacks[unsubscribeKey] = unsub;
-        }
+        this.#unsubCallbacks.set(key, unsub);
 
         return unsub;
     }
@@ -434,33 +477,163 @@ class State extends EventTarget {
         if (!Array.isArray(arrayOfSubscriptionObjects)) {
             throw new UpStateError(
                 "'batchSubscriptions' was expecting an array of objects meant for the subscribe method",
-                "INVALID_BATCH_SUB_ARGUMENT"
+                "INVALID_ARG"
             );
         }
 
-        return arrayOfSubscriptionObjects.map(obj => this.subscribe(obj))
+        const unsubs = {};
+
+        arrayOfSubscriptionObjects.forEach(obj => {
+            unsubs[obj.key] = this.subscribe(obj)
+        });
+
+        return unsubs;
     }
 
     unsubscribe(keys) {
 
         const unsubFunc = (key) => {
-            if (typeof key !== "string" && key !== undefined) {
-                throw new UpStateError("'unsubscribeKey' value has to be a string", "INVALID_UNSUB_KEY");
+            if (typeof key !== "string") {
+                throw new UpStateError("'key' has to be a string", "INVALID_ARG");
+            }
+            if (!this.#unsubCallbacks.has(key)) {
+                throw new UpStateError(`no subscription found for key "${key}"`, "INVALID_ARG");
             }
 
-            if (typeof key !== "string" || !this.#unsubCallbacks[key]) {
-                throw new UpStateError(`no subscription found for key "${key}"`, "INVALID_UNSUB_KEY");
-            }
-
-            this.#unsubCallbacks[key]();
+            this.#unsubCallbacks.get(key)();
         }
 
         if (Array.isArray(keys)) {
-
-            keys.forEach(key => unsubFunc(key))
-
+            keys.forEach(key => unsubFunc(key));
         } else {
-            unsubFunc(keys)
+            unsubFunc(keys);
+        }
+    }
+
+    batchUnsubscribe(keys) {
+        if (!Array.isArray(keys)) {
+            throw new UpStateError(
+                "'batchUnsubscribe' was expecting an array of keys",
+                "INVALID_BATCH_UNSUB_ARGUMENT"
+            );
+        }
+
+        keys.forEach(key => this.unsubscribe(key));
+    }
+    // New helper — one pass, derives up/down from shared-prefix + length
+    #compareRoutes(splitFired, splitSub) {
+        const shorter = Math.min(splitFired.length, splitSub.length);
+        let sharedPrefix = true;
+
+        for (let i = 0; i < shorter; i++) {
+            if (splitFired[i] !== splitSub[i]) {
+                sharedPrefix = false;
+                break;
+            }
+        }
+
+        return {
+            both: sharedPrefix,
+            up: sharedPrefix && splitSub.length <= splitFired.length,
+            down: sharedPrefix && splitFired.length <= splitSub.length,
+        };
+    }
+
+    #fireEntireCollection(routeMap, collection, firedCallbacks) {
+        const collectionState = this.#cloneValue(
+            this.#state[collection],
+            this.#cloningOptions.onSubscribe
+        );
+
+        routeMap.forEach((value) => {
+            value.routeNode.forEach((v) => {
+                if (firedCallbacks.has(v.key)) return;
+                firedCallbacks.add(v.key);
+
+                // "none" only fires when its exact route is targeted.
+                // For collection-level subs that means a full-collection set(), not a route change.
+                if (v.propagation !== "none" || v.route === FIREONENTIRECOLLECTION) {
+                    v.callback(collectionState);
+                }
+            });
+        });
+    }
+
+    #fireSpecificRoute(routeMap, collection, route, firedCallbacks) {
+        if (!this.#splitRouteCache.has(collection)) {
+            this.#splitRouteCache.set(collection, new Map());
+        }
+
+        const collectionCache = this.#splitRouteCache.get(collection);
+
+        if (!collectionCache.has(route)) {
+            if (collectionCache.size >= 1000) {
+                collectionCache.delete(collectionCache.keys().next().value);
+            }
+            collectionCache.set(route, route.split(/[./]/));
+        } else {
+            // Re-insert to mark as recently used
+            const val = collectionCache.get(route);
+            collectionCache.delete(route);
+            collectionCache.set(route, val);
+        }
+
+        const splitFired = collectionCache.get(route);
+
+        for (const [key, value] of routeMap) {
+
+            if (key === FIREONENTIRECOLLECTION) {
+                // A collection-level subscriber with propagation "none" means:
+                // "only fire when the whole collection is set", so skip it here.
+                const collectionState = this.#cloneValue(
+                    this.#state[collection],
+                    this.#cloningOptions.onSubscribe
+                );
+
+                value.routeNode.forEach((v) => {
+                    if (firedCallbacks.has(v.key)) return;
+                    firedCallbacks.add(v.key);
+
+                    if (v.propagation !== "none") {
+                        v.callback(collectionState);
+                    }
+                });
+
+            } else {
+                const match = this.#compareRoutes(splitFired, value.splitRoute);
+                const { targetParent, targetKey } = Utility.getPathInfo(collection, key, this.#state);
+                const data = this.#cloneValue(
+                    targetParent?.[targetKey],
+                    this.#cloningOptions.onSubscribe
+                );
+
+                value.routeNode.forEach((v) => {
+                    if (firedCallbacks.has(v.key)) return;
+                    firedCallbacks.add(v.key);
+
+                    switch (v.propagation) {
+                        case "up": if (match.up) v.callback(data); break;
+                        case "down": if (match.down) v.callback(data); break;
+                        case "both": if (match.both) v.callback(data); break;
+                        case "none": if (route === v.route) v.callback(data); break;
+                    }
+                });
+            }
+        }
+    }
+
+    // Orchestrator — now just routing logic, no implementation detail
+    #fireSubscriptionCallbacks(collection, route) {
+        if (!this.#subscriptions.has(collection)) return;
+
+        const firedCallbacks = new Set();
+        route = route ?? FIREONENTIRECOLLECTION;
+        const routeMap = this.#subscriptions.get(collection);
+
+        if (route === FIREONENTIRECOLLECTION) {
+            this.#fireEntireCollection(routeMap, collection, firedCallbacks);
+        } else {
+            this.#fireSpecificRoute(routeMap, collection, route, firedCallbacks);
         }
     }
 
@@ -473,61 +646,6 @@ class State extends EventTarget {
         }
     }
 
-    #fireSubscriptionCallbacks(collection, changedPath) {
-        const subs = this.#subscriptions.collections[collection];
-        if (!subs) return;
-
-        const route = changedPath?.split(/[./]/) || [];
-
-        for (const [key, value] of subs) {
-
-            const subRoute = value || [];
-            const shorter = Math.min(route.length, subRoute.length);
-
-            let compare = true;
-
-            for (let i = 0; i < shorter; i++) {
-                if (route[i] !== subRoute[i]) { compare = false; break; }
-            }
-
-            if (key === "fireOnEntireCollection") {
-
-
-                const cbs = this.#subscriptions.callbacks[collection][key];
-                if (Array.isArray(cbs)) {
-                    cbs.forEach(cb => {
-                        if (typeof cb === 'function') {
-                            const data = this.#cloneValue(this.#state[collection], this.#cloningOptions.onSubscribe);
-                            cb(new Result(data))
-                        }
-                    });
-                }
-
-            } else if (compare) {
-
-                const destination = Utility.getPathInfo(
-                    collection,
-                    key,
-                    this.#state,
-                    false
-                );
-                const actualValue = destination?.targetParent?.[destination.targetKey];
-
-                // Trigger the callback
-                const cbs = this.#subscriptions.callbacks[collection][key];
-
-                if (Array.isArray(cbs)) {
-                    cbs.forEach(cb => {
-                        if (typeof cb === 'function') {
-                            const data = this.#cloneValue(actualValue, this.#cloningOptions.onSubscribe);
-                            cb(new Result(data))
-                        }
-                    });
-                }
-            }
-        }
-    }
-
     set(setObject = {}) { this.#factorySet(setObject) }
 
     #factorySet(
@@ -537,16 +655,16 @@ class State extends EventTarget {
         fireSubscriptionCallbacks = !!fireSubscriptionCallbacks;
 
         if (collection === undefined || collection === "") {
-            throw new UpStateError("'collection' value has to be be a String", "MISSING_COLLECTION_REF");
+            throw new UpStateError("'collection' value has to be be a String", "MISSING_ARG");
         }
 
         if (typeof collection !== "string") {
-            throw new UpStateError("'collection' can only be a String", "INVALID_COLLECTION_REF");
+            throw new UpStateError("'collection' can only be a String", "INVALID_ARG");
         }
 
         // Avoid falsy checks — they would incorrectly reject valid values like 0, false, []
         if (state === undefined) {
-            throw new UpStateError("state value cannot be undefined", "INVALID_STATE_VALUE");
+            throw new UpStateError("state value cannot be undefined", "INVALID_ARG");
         }
 
         state = (typeof state === 'object' && state !== null)
@@ -580,7 +698,7 @@ class State extends EventTarget {
         if (typeof persistence !== "string" && persistence !== undefined) {
             throw new UpStateError(
                 "'persistence' can only be a string",
-                "INVALID_PERSISTENCE_VALUE"
+                "INVALID_ARG"
             );
 
         }
@@ -594,7 +712,7 @@ class State extends EventTarget {
             } else {
                 throw new UpStateError(
                     "'persistence' value can only be either 'session' or 'permanent'",
-                    "INVALID_PERSISTENCE_VALUE"
+                    "INVALID_ARG"
                 );
             }
         }
@@ -608,16 +726,22 @@ class State extends EventTarget {
         }
     }
 
-    get(collection, route) {
+    get(collectionOrObject, route) {
+        let collection = collectionOrObject;
+
+        if (typeof collectionOrObject === "object" && collectionOrObject !== null) {
+            collection = collectionOrObject.collection;
+            route = collectionOrObject.route;
+        }
 
         if (collection === undefined) return new Result(this.#cloneValue(this.#state, this.#cloningOptions.onGet));
 
         if (collection === "") {
-            throw new UpStateError("'collection' value has to be be a String", "MISSING_COLLECTION_REF");
+            throw new UpStateError("'collection' value has to be be a String", "MISSING_ARG");
         }
 
         if (typeof collection !== "string") {
-            throw new UpStateError("'collection' value has to be be a String", "INVALID_COLLECTION_REF");
+            throw new UpStateError("'collection' value has to be be a String", "INVALID_ARG");
         }
 
         if (!(collection in this.#state)) return new Result(null);
@@ -633,18 +757,28 @@ class State extends EventTarget {
         return new Result(output);
     }
 
-    remove(collection, route) { this.#factoryRemove(collection, route) }
+    remove(collectionOrObject, route) {
+
+        let collection = collectionOrObject;
+
+        if (typeof collectionOrObject === "object" && collectionOrObject !== null) {
+            collection = collectionOrObject.collection;
+            route = collectionOrObject.route;
+        }
+
+        this.#factoryRemove(collection, route)
+    }
 
     #factoryRemove(collection, route, { dispatchUpdateEvent = true, fireSubscriptionCallbacks = true } = {}) {
 
         // console.log(collection,route)
         fireSubscriptionCallbacks = !!fireSubscriptionCallbacks;
         if (collection === undefined || collection === "") {
-            throw new UpStateError("'collection' value has to be be a String", "MISSING_COLLECTION_REF");
+            throw new UpStateError("'collection' value has to be be a String", "MISSING_ARG");
         }
 
         if (typeof collection !== "string") {
-            throw new UpStateError("'collection' value has to be be a String", "INVALID_COLLECTION_REF");
+            throw new UpStateError("'collection' value has to be be a String", "INVALID_ARG");
         }
 
         const destination = {};
@@ -654,15 +788,23 @@ class State extends EventTarget {
             destination.targetKey = collection;
             delete this.#state[collection];
 
+            this.#splitRouteCache.delete(collection);
             if (fireSubscriptionCallbacks) {
                 this.#fireSubscriptionCallbacks(collection);
             }
+
         } else {
             const { targetParent, targetKey } = Utility.getPathInfo(collection, route, this.#state, false);
             destination.targetParent = targetParent;
             destination.targetKey = targetKey;
             if (targetParent && targetKey in targetParent) {
                 delete targetParent[targetKey];
+
+                if (this.#splitRouteCache.has(collection)) {
+                    const collectionCache = this.#splitRouteCache.get(collection);
+
+                    collectionCache.delete(route);
+                }
 
                 if (fireSubscriptionCallbacks) {
                     this.#fireSubscriptionCallbacks(collection, route);
@@ -691,7 +833,7 @@ class State extends EventTarget {
         if (!Array.isArray(arrayOfSetObjects)) {
             throw new UpStateError(
                 "was expecting an array of objects meant for the Upstate.set method",
-                "INVALID_BATCH_SET_ARGUMENT"
+                "INVALID_ARG"
             );
         }
         const changedRoutes = new Map(); // collection → Set of routes
@@ -700,20 +842,14 @@ class State extends EventTarget {
             this.#factorySet(setObject, { fireSubscriptionCallbacks: false, dispatchUpdateEvent: false });
 
             if (!changedRoutes.has(setObject.collection)) changedRoutes.set(setObject.collection, new Set());
-
-            changedRoutes.get(setObject.collection).add(setObject.route || "fireOnEntireCollection");
+            changedRoutes.get(setObject.collection).add(setObject.route || null);
 
         });
 
         changedRoutes.forEach((routes, collection) => {
 
-            // Fire collection-level subscribers once
-
-            // Fire route-level subscribers per changed route, skipping collection-level
             routes.forEach(route => {
-
-
-                if (route) this.#fireSubscriptionCallbacks(collection, route);
+                this.#fireSubscriptionCallbacks(collection, route ?? undefined);
             });
         });
 
@@ -733,7 +869,7 @@ class State extends EventTarget {
         if (!Array.isArray(arrayOfGetRequests)) {
             throw new UpStateError(
                 "'batchGet' expects an array of objects meant for the 'get' method",
-                "INVALID_BATCH_GET_ARGUMENT"
+                "INVALID_ARG"
             );
         }
 
@@ -753,7 +889,7 @@ class State extends EventTarget {
         if (!Array.isArray(arrayOfRemoveRequests)) {
             throw new UpStateError(
                 " 'batchRemove' was expecting an array of objects meant for the 'remove' method",
-                "INVALID_BATCH_REMOVE_ARGUMENT"
+                "INVALID_ARG"
             );
         }
 
@@ -782,8 +918,287 @@ class State extends EventTarget {
             }));
         }
     }
+
+    emitState({ name, id, payload, collection, route, callback, transform } = {}) {
+
+        if (name === undefined) {
+            throw new UpStateError(`'name' is required`, "MISSING_ARG");
+        }
+
+        if (typeof name !== "string") {
+            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
+        }
+
+        if (id !== undefined && typeof id !== "string" && typeof id !== "number") {
+            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG");
+        }
+
+        if (typeof callback !== "function" && callback !== undefined) {
+            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
+        }
+
+        if (typeof transform !== "function" && transform !== undefined) {
+            throw new UpStateError(`'transform' can only be a function`, "INVALID_ARG");
+        }
+
+        const data = this.get(collection, route);
+
+        const resolved = transform ? transform(data) : data;
+
+        this.#bus.dispatchEvent(
+            new CustomEvent(name, {
+                detail: { payload, data: resolved, callback }
+            })
+        );
+    }
+
+    onEmit({ name, callback }) {
+
+        if (name === undefined) {
+            throw new UpStateError(`'name' is required`, "MISSING_ARG"
+            );
+        }
+
+        if (typeof name !== "string") {
+            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
+        }
+
+        if (this.#killEmitRegistry.has(name)) {
+            throw new UpStateError(`there is already an 'onEmit' with this name`, "INVALID_ARG");
+        }
+
+        if (typeof callback !== "function") {
+            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
+        }
+
+        let abortCont = new AbortController();
+
+        this.#bus.addEventListener(name, event => {
+            const detail = event.detail;
+            callback({
+                payload: detail.payload,
+                data: detail.data,
+                callback: detail.callback
+            });
+        }, { signal: abortCont.signal })
+
+        this.#killEmitRegistry.set(name, () => {
+            if (abortCont) {
+                abortCont.abort()
+                abortCont = null;
+            }
+        })
+    }
+
+    #kill(name, where) {
+        if (name === undefined) { throw new UpStateError(`'name' is required`, "MISSING_ARG"); }
+        if (typeof name !== "string") { throw new UpStateError(`'name' can only be a string`, "INVALID_ARG"); }
+        if (where.has(name)) {
+            where.get(name)();
+            where.delete(name);
+        }
+    }
+
+
+    request({ name, id, payload, destination, callback, transform, ttl = 120 } = {}) {
+
+        ttl = Number(ttl);
+
+        if (isNaN(ttl)) {
+            throw new UpStateError(`'ttl' can only be a number`, "INVALID_ARG");
+        }
+
+        ttl = ttl * 1000;
+
+        if (name === undefined) {
+            throw new UpStateError(`'name' is required`, "MISSING_ARG");
+        }
+
+        if (typeof name !== "string") {
+            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
+        }
+
+
+        if (id !== undefined && typeof id !== "string" && typeof id !== "number") {
+            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG");
+        }
+
+        if (typeof callback !== "function" && callback !== undefined) {
+            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
+        }
+
+        if (typeof transform !== "function" && transform !== undefined) {
+            throw new UpStateError(`'transform' can only be a function`, "INVALID_ARG");
+        }
+
+        const uid = id ?? crypto.randomUUID();
+
+
+        this.#ttlTimeout.set(uid, setTimeout(e => {
+            this.response(uid, {
+                error: true,
+                payload: null
+            });
+            this.#ttlTimeout.delete(uid)
+        }, ttl))
+
+        this.#bus.dispatchEvent(
+            new CustomEvent(name, {
+                detail: {
+                    payload,
+                    destination,
+                    uid,
+                    transform,
+                    callback,
+                    ttl,
+                }
+            })
+        );
+
+        return uid;
+    }
+
+    onRequest({ name, id, callback }) {
+
+        if (id !== undefined && typeof id !== "string" && typeof id !== "number") {
+            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG");
+        }
+
+        if (name === undefined) {
+            throw new UpStateError(`'name' is required`, "MISSING_ARG");
+        }
+
+        if (typeof name !== "string") {
+            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
+        }
+
+        if (this.#killRequestRegistry.has(name)) {
+            throw new UpStateError(`there is already an 'onRequest' with this name`, "INVALID_ARG");
+        }
+
+        if (callback === undefined) {
+            throw new UpStateError(`'callback' is required`, "INVALID_ARG");
+        }
+
+        if (typeof callback !== "function") {
+            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
+        }
+
+        let abortCont = new AbortController();
+
+        this.#bus.addEventListener(name, event => {
+            const detail = event.detail;
+            const uid = id ?? detail.uid;
+
+            const baggage = Object.create(null);
+
+            baggage.uid = detail.uid;
+            baggage.destination = detail.destination;
+            baggage.transform = detail.transform;
+            baggage.callback = detail.callback;
+
+            this.#requestDetailCache.set(uid, baggage);
+
+            callback(uid, detail.payload);
+
+        }, { signal: abortCont.signal })
+
+        this.#killRequestRegistry.set(name, () => {
+            if (abortCont) {
+                abortCont.abort()
+                abortCont = null;
+            }
+        })
+    }
+
+    response(idOrObject, data) {
+
+        let id = idOrObject;
+
+        if (typeof idOrObject === "object" && idOrObject !== null) {
+            id = idOrObject.id;
+            data = idOrObject.data;
+        }
+
+        if (!this.#requestDetailCache.has(id)) {
+            throw new UpStateError(
+                `'id' should be set to the first perimitor of the receiveRequest's callback`,
+                "INVALID_ARG"
+            );
+        }
+
+        const baggage = this.#requestDetailCache.get(id);
+
+        const resolved = baggage.transform ? baggage.transform(data) : data;
+
+        if (baggage.callback) baggage.callback(resolved);
+        if (baggage.destination) this.set({ ...baggage.destination, state: resolved });
+
+        this.#requestDetailCache.delete(id);
+
+        clearTimeout(this.#ttlTimeout.get(id));
+        this.#ttlTimeout.delete(id);
+
+        this.#bus.dispatchEvent(
+            new CustomEvent(baggage.uid, {
+                detail: { payload: resolved }
+            })
+        );
+    }
+
+    onResponse({ id, once, abortController, callback }) {
+        const options = {};
+        options.once = once ? !!once : true;
+
+        if (abortController !== undefined && !(abortController instanceof AbortController)) {
+            throw new UpStateError(`invalid abortSignal`, "INVALID_ARG");
+        }
+
+        if (id === undefined) {
+            throw new UpStateError(`'id' is required`, "INVALID_ARG"
+            );
+        }
+
+        if (typeof id !== "string" && typeof id !== "number") {
+            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG"
+            );
+        }
+
+        if (this.#killResponseRegistry.has(id)) {
+            throw new UpStateError(`there is already an 'onResponse' with this name`, "INVALID_ARG");
+        }
+
+        if (typeof callback !== "function") {
+            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG"
+            );
+        }
+
+        abortController = abortController ? abortController : new AbortController();
+        options.signal = abortController.signal;
+
+        this.#bus.addEventListener(id, event => {
+            callback({ error: false, payload: event.detail.payload });
+
+            if (options.once) { this.killOnResponse(id); }
+            clearTimeout(this.#ttlTimeout.get(id));
+            this.#ttlTimeout.delete(id);
+        }, options);
+
+        this.#killResponseRegistry.set(id, () => {
+            if (abortController) {
+                abortController.abort()
+                abortController = null;
+            }
+        })
+    }
+
+    killOnEmit(type) { this.#kill(type, this.#killEmitRegistry) }
+    killOnRequest(type) { this.#kill(type, this.#killRequestRegistry) }
+    killOnResponse(id) { this.#kill(id, this.#killResponseRegistry) }
+
 }
 
 const UpState = new State();
 Object.freeze(UpState);
+export { State };
 export default UpState;
