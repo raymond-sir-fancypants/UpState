@@ -1,8 +1,8 @@
 # UpState
 
-**Version 4.2.0** — A lightweight, dependency-free reactive state management library for the browser.
+**Version 5.0.0** — A lightweight, dependency-free reactive state management library for the browser.
 
-UpState gives you a simple, predictable way to manage application state — with optional persistence to `localStorage` or `sessionStorage`, reactive subscriptions at any depth of your state tree, a decoupled request/response bus, a fire-and-forget emit bus, and safe result handling that never throws on missing data.
+UpState gives you a simple, predictable way to manage application state — with optional persistence to `localStorage` or `sessionStorage`, reactive subscriptions at any depth of your state tree, a rich debug and introspection API, and safe result handling that never throws on missing data, all with zero dependencies.
 
 No dependencies. No build step. Just import and go.
 
@@ -18,6 +18,7 @@ UpState.get('user').raw; // { name: 'Alice' }
 ## Table of Contents
 
 - [Features](#features)
+- [What's New in v5.0.0](#whats-new-in-v500)
 - [Browser Support](#browser-support)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -28,23 +29,24 @@ UpState.get('user').raw; // { name: 'Alice' }
   - [get](#upstategetcollection-route)
   - [remove](#upstateremovecollection-route)
   - [subscribe](#upstatesubscribeoptions)
-  - [unsubscribe](#upstateunsubscribekeys)
+  - [unsubscribe](#upstateunsubscribekey)
   - [batchSet](#upstatebatchsetarrayofsetobjects)
   - [batchGet](#upstatebatchgetarrayofgetrequests)
   - [batchRemove](#upstatebatchremovearrayofremoverequests)
-  - [batchSubscriptions](#upstatebatchsubscriptionsarrayofsubscriptionobjects)
+  - [batchSubscribe](#upstatebatchsubscribearrayofsubscriptionobjects)
   - [batchUnsubscribe](#upstatebatchunsubscribekeys)
+  - [purge](#upstatepurgeoptions)
+- [The Debug API](#the-debug-api)
 - [Result](#result)
 - [Persistence](#persistence)
 - [Subscriptions In Depth](#subscriptions-in-depth)
-- [Emit Bus](#emit-bus)
-- [Request / Response Bus](#request--response-bus)
 - [The `update` Event](#the-update-event)
 - [EventTarget Aliases](#eventtarget-aliases)
 - [Creating Isolated Instances](#creating-isolated-instances)
 - [Error Handling](#error-handling)
 - [Route Syntax](#route-syntax)
 - [Cloning Modes](#cloning-modes)
+- [structuredClone Warning](#structuredclone-warning)
 - [Third-party Object Warning](#third-party-object-warning)
 - [Known Limitations](#known-limitations)
 - [License](#license)
@@ -61,12 +63,44 @@ UpState.get('user').raw; // { name: 'Alice' }
 - 🔁 Event-driven — listen for any state change via the `update` event
 - 🛡️ Safe `Result` wrapper — never throws on missing data, with `.asArray`, `.asObject`, `.mapArray` and `.mapObject` helpers
 - 📂 Nested state support via dot or slash routes (`"user/profile/name"`)
-- ⚡ Batch operations — `batchSet`, `batchGet`, `batchRemove`, `batchSubscriptions`, and `batchUnsubscribe` for efficient multi-value operations
+- ⚡ Batch operations — `batchSet`, `batchGet`, `batchRemove`, `batchSubscribe`, and `batchUnsubscribe` for efficient multi-value operations
 - 💾 Two-tier persistence — store state as `"session"` (sessionStorage) or `"permanent"` (localStorage), per collection or per write
+- ⏳ Expiring persistence — set TTL on any persisted value using shorthands like `"30d"`, `"12h"`, `"30m"`
 - 📅 Auto date hydration — ISO 8601 strings are automatically revived as `Date` objects on load
-- 🧬 Configurable cloning — choose `"deep"`, `"shallow"`, or `"off"` globally or individually for `set`, `get`, and `subscribe` operations
-- 📡 Emit bus — fire-and-forget state broadcasts with optional transform and callback
-- 🔄 Request/response bus — decoupled cross-module communication with TTL, abort, and auto-write-to-state
+- 🧬 Configurable cloning — choose `"deep"`, `"shallow"`, or `"off"` globally or per-operation for `set`, `get`, and `subscribe`
+- 🔍 Built-in debug API — inspect state, routes, subscriptions, metrics, persistence, and live trace changes
+
+---
+
+## What's New in v5.0.0
+
+### ✅ Added — Debug API
+
+A frozen `debug` object is now available on the UpState instance (and all `State` instances) with a suite of introspection methods. See [The Debug API](#the-debug-api) for full reference.
+
+### ✅ Added — `purge()`
+
+A new `purge()` method wipes all in-memory state, subscriptions, caches, and (optionally) storage in one operation. Useful for logout flows or full application resets. See [purge](#upstatepurgeoptions).
+
+### ✅ Added — `unsubscribeOnDelete` config option
+
+When `true` (the default), removing a collection via `remove()` automatically unsubscribes all of its active listeners. Set to `false` to opt out if you manage those subscriptions yourself.
+
+### ✅ Added — Expiring persistence
+
+The `expiry` field on persistence objects now supports time shorthands: `"30d"`, `"12h"`, `"30m"`, `"60s"`, `"500ms"`, or a raw number in milliseconds. Expired entries are silently stripped on load.
+
+```js
+UpState.set({
+  collection: 'auth',
+  state: { token: 'abc123' },
+  persistence: { type: 'permanent', expiry: '7d' }
+});
+```
+
+### ❌ Removed — Bus system
+
+The emit bus (`emitState`, `onEmit`) and the request/response bus (`request`, `onRequest`, `response`, `onResponse`, `killOnRequest`, `killOnResponse`) have been removed.
 
 ---
 
@@ -81,7 +115,7 @@ UpState.get('user').raw; // { name: 'Alice' }
 
 Requires: ES2022 private class fields, `structuredClone`, `EventTarget`, `localStorage`, `sessionStorage`, `crypto.randomUUID`.
 
-> UpState includes a manual deep-clone fallback if `structuredClone` fails, so it degrades gracefully with a polyfill for older targets.
+> UpState includes a manual deep-clone fallback if `structuredClone` fails, but see the [structuredClone Warning](#structuredclone-warning) for the performance implications.
 
 ---
 
@@ -139,15 +173,12 @@ unsub(); // stop listening
 
 ## Architecture Overview
 
-UpState has two separate event surfaces:
+UpState is a single `EventTarget` instance (the public `UpState` export, which is a frozen `State` singleton). Its event surface is:
 
-**1. Public `EventTarget` (`UpState` itself)**
+**Public `EventTarget` (`UpState` itself)**
 Used for the `"update"` CustomEvent, which fires after every `set`, `remove`, `batchSet`, and `batchRemove` operation. You attach listeners here with `addEventListener` (or the `.on` alias).
 
-**2. Internal `#bus` (`EventTarget`)**
-A private, encapsulated event target used exclusively by the [Emit Bus](#emit-bus) and [Request/Response Bus](#request--response-bus). This keeps those channels isolated from the public `"update"` event and from any user-defined event names.
-
-You never interact with `#bus` directly — it is accessed only through `emitState`/`onEmit` and `request`/`onRequest`/`response`/`onResponse`.
+There is no secondary internal bus in v5. Cross-module communication patterns previously handled by the bus system are best achieved via subscriptions or the `"update"` event.
 
 ---
 
@@ -163,7 +194,8 @@ UpState.config({
   },
   cloning: 'deep',
   allowEventDispatches: true,
-  silenceWarnings: false
+  silenceWarnings: false,
+  unsubscribeOnDelete: true
 });
 ```
 
@@ -171,40 +203,11 @@ UpState.config({
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `persistentCollections` | `Object` | `{}` | Map of `collectionName → "session" \| "permanent"`. Only collections that **already exist in state** at the time `config()` is called are registered. For collections written after `config()`, pass `persistence` directly to `set()`. |
+| `persistentCollections` | `Object` | `{}` | Map of `collectionName → "session" \| "permanent" \| { type, expiry }`. Only collections that **already exist in state** at the time `config()` is called are registered. For collections written after `config()`, pass `persistence` directly to `set()`. |
 | `cloning` | `"deep" \| "shallow" \| "off" \| Object` | `"deep"` | Controls value cloning. See [Cloning Modes](#cloning-modes). |
 | `allowEventDispatches` | `boolean` | `true` | When `false`, the `"update"` CustomEvent is never dispatched. Useful in environments without a DOM or in tests. |
 | `silenceWarnings` | `boolean` | `false` | When `true`, suppresses non-critical internal console warnings. |
-
-### Cloning Modes
-
-Controls how state is cloned on `set`, `get`, and subscription callbacks.
-
-| Mode | Behaviour | Use case |
-|---|---|---|
-| `"deep"` | Full `structuredClone` — no shared references (default) | Safety first |
-| `"shallow"` | Top-level spread only — nested objects are shared | Large flat objects |
-| `"off"` | No cloning — direct reference to internal state | Maximum performance |
-
-Apply one mode to all operations, or configure per-operation:
-
-```js
-UpState.config({
-  cloning: { onSet: 'deep', onGet: 'shallow', onSubscribe: 'off' }
-});
-```
-
-#### Benchmark (realistic app-scale state)
-
-Tested on 1000 users + nested settings + 500 log entries, 100 cycles:
-
-| Mode | Avg Set | Avg Get |
-|---|---|---|
-| `deep` | 14.50ms | 0.01ms |
-| `shallow` | 0.003ms | 0.003ms |
-| `off` | 0.002ms | 0.001ms |
-
-`get` is fast across all modes — UpState only clones the retrieved value, not the whole state.
+| `unsubscribeOnDelete` | `boolean` | `true` | When `true`, removing a collection automatically unsubscribes all its active listeners. |
 
 ---
 
@@ -227,179 +230,112 @@ UpState.set({ collection: 'cart', route: 'items/0/qty', state: 2 }); // equivale
 // Persist to storage
 UpState.set({ collection: 'auth', state: { token: 'abc' }, persistence: 'session' });
 
-// Falsy values are valid
-UpState.set({ collection: 'flags', state: false });
-UpState.set({ collection: 'count', state: 0 });
+// Persist with expiry
+UpState.set({
+  collection: 'auth',
+  state: { token: 'abc' },
+  persistence: { type: 'permanent', expiry: '7d' }
+});
 ```
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `collection` | `string` | ✅ | Top-level namespace |
-| `state` | `*` | ✅ | Any value except `undefined` |
-| `route` | `string` | — | Dot/slash path to a nested property |
-| `persistence` | `"session" \| "permanent"` | — | Persists to browser storage. Overrides collection-level config. |
+| `collection` | `string` | ✅ | The top-level state bucket to write to. |
+| `state` | `*` | ✅ | The value to write. Any JSON-safe type. Cannot be `undefined`. |
+| `route` | `string` | — | Dot or slash-separated path within the collection. |
+| `persistence` | `"session" \| "permanent" \| { type, expiry }` | — | Persists this write to storage. Overrides any collection-level default from `config()`. |
 
 ---
 
-### `UpState.get(collection?, route?)`
+### `UpState.get(collection, route)`
 
-Reads a value. Always returns a [`Result`](#result). The value is cloned according to the `onGet` cloning option before being wrapped.
-
-Supports multiple call signatures:
+Reads a value from state and returns it wrapped in a `Result`. Never throws if the path doesn't exist — returns `new Result(null)` instead.
 
 ```js
-UpState.get('cart').raw;               // entire collection
-UpState.get('cart', 'total').raw;      // nested path (positional)
-UpState.get({ collection: 'cart', route: 'total' }).raw; // object form
-UpState.get().raw;                     // entire state tree
-UpState.get('nonExistent').raw;        // null — never throws
+UpState.get('user').raw;               // whole collection
+UpState.get('user', 'profile.name').raw; // nested value
+UpState.get({ collection: 'user', route: 'profile.name' }).raw; // object form
+
+UpState.get().raw; // returns a clone of the entire state tree
 ```
 
-If the collection or path does not exist, `Result.raw` is `null`.
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `collection` | `string` | — | The collection to read from. Omit to get the full state tree. |
+| `route` | `string` | — | Dot or slash-separated path within the collection. |
+
+Returns a [`Result`](#result) instance.
 
 ---
 
-### `UpState.remove(collection, route?)`
+### `UpState.remove(collection, route)`
 
-Removes a collection or a nested property from state and from both `localStorage` and `sessionStorage`.
-
-Supports both positional and object-form arguments.
+Deletes a value from state. If `route` is omitted, the entire collection is deleted. Fires matching subscriptions and dispatches an `"update"` event.
 
 ```js
-UpState.remove('cart', 'items.0');              // removes one item
-UpState.remove('cart');                         // removes entire collection
+UpState.remove('cart');                        // delete entire collection
+UpState.remove('cart', 'items.0');             // delete a nested value
 UpState.remove({ collection: 'cart', route: 'items.0' }); // object form
 ```
 
-Fires matching subscriptions and dispatches an `"update"` event after removal.
+When a collection is deleted and `unsubscribeOnDelete` is `true` (the default), all subscriptions for that collection are automatically removed.
 
 ---
 
 ### `UpState.subscribe(options)`
 
-Subscribes to changes on a collection or route. Returns an unsubscribe function.
+Registers a callback to fire when a specific piece of state changes. Returns an `unsub` function that removes the subscription when called.
 
 ```js
 // Watch an entire collection
 const unsub = UpState.subscribe({
-  collection: 'cart',
-  key: 'cartWatcher',
-  callback: (value) => renderCart(value)
+  collection: 'user',
+  key: 'myWatcher',
+  callback: (value) => console.log(value)
 });
 
-// Watch a specific nested path
+// Watch a specific nested route
 UpState.subscribe({
-  collection: 'cart',
-  route: 'total',
-  key: 'cartTotalWatcher',
-  callback: (value) => updateTotal(value)
+  collection: 'user',
+  route: 'profile.name',
+  key: 'nameWatcher',
+  callback: (name) => renderName(name)
 });
 
-unsub();                             // via returned function
-UpState.unsubscribe('cartWatcher'); // or by key
+// Remove the subscription
+unsub();
+// or
+UpState.unsubscribe('nameWatcher');
 ```
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `collection` | `string` | ✅ | Collection to watch |
-| `key` | `string` | ✅ | Unique identifier for this subscription. Must not already be in use. Used to unsubscribe later. |
-| `callback` | `Function` | ✅ | `(value) => void`. Receives the raw cloned value at the subscribed route. **Not** a `Result` wrapper. |
-| `route` | `string` | — | Dot/slash path within the collection. Omit to subscribe to the whole collection. |
-| `propagation` | `string` | — | Controls which changes trigger the callback. See below. Defaults to `"exact"`. |
-
-#### Callback Value
-
-The callback receives the **raw cloned value** at the subscribed route — not a `Result`. The value is cloned according to the `onSubscribe` cloning option.
-
-```js
-UpState.subscribe({
-  collection: 'user',
-  route: 'name',
-  key: 'nameWatcher',
-  callback: (value) => {
-    console.log(value); // 'Alice' — raw string, not a Result
-  }
-});
-```
-
-If you need a `Result`, call `UpState.get()` inside the callback.
-
-#### Propagation Modes
-
-The `propagation` option controls which state changes trigger the callback:
-
-| Value | Fires when… |
-|---|---|
-| `"exact"` (default) | Only the exact subscribed path changes directly |
-| `"ancestors"` | The subscribed path **or any ancestor** of it changes |
-| `"descendants"` | The subscribed path **or any descendant** of it changes |
-| `"related"` | Any ancestor **or** descendant change (both directions) |
-
-```js
-// Only fires when 'user.name' is set directly
-UpState.subscribe({
-  collection: 'user',
-  route: 'name',
-  key: 'exactName',
-  propagation: 'exact',
-  callback: (value) => console.log(value)
-});
-
-// Fires when 'user.name' changes OR when the entire 'user' collection is replaced
-UpState.subscribe({
-  collection: 'user',
-  route: 'name',
-  key: 'ancestorName',
-  propagation: 'ancestors',
-  callback: (value) => console.log(value)
-});
-```
-
-**Collection-level subscribers** (no `route`) with `propagation: "exact"` only fire when the entire collection is replaced, not when a nested key changes. Use `"descendants"` or `"related"` to also fire on nested changes.
-
-#### Subscription best practices
-
-Subscribe as deep as possible — at the exact value you care about — to avoid unnecessary callback invocations:
-
-```js
-// ❌ Too broad — fires for any change under 'profile'
-UpState.subscribe({
-  collection: 'users',
-  route: 'profile',
-  key: 'profileWatcher',
-  callback: (value) => { ... }
-});
-
-// ✅ Targeted — each callback only fires when its value changes
-UpState.subscribe({ collection: 'users', route: 'profile/avatar', key: 'avatarWatcher', callback: updateAvatar });
-UpState.subscribe({ collection: 'users', route: 'profile/name',   key: 'nameWatcher',   callback: updateName  });
-```
-
-Broad subscriptions tend to grow into defensive callbacks that manually check what actually changed — which is a sign the subscription is too high in the tree.
+| `collection` | `string` | ✅ | The collection to watch. |
+| `route` | `string` | — | The nested path to watch. Omit to watch the entire collection. |
+| `callback` | `Function` | ✅ | Receives the current value at the subscribed path. Not a `Result`. |
+| `key` | `string` | — | A unique identifier for this subscription. Required to use `unsubscribe(key)`. Auto-generated if omitted. |
+| `propagation` | `string` | — | Controls which related route changes trigger this callback. See [Subscriptions In Depth](#subscriptions-in-depth). |
 
 ---
 
-### `UpState.unsubscribe(keys)`
+### `UpState.unsubscribe(key)`
 
-Removes one or more subscriptions by their `key`.
+Removes the subscription registered under `key`. Throws if the key is not found.
 
 ```js
-UpState.unsubscribe('cartWatcher');
-UpState.unsubscribe(['cartWatcher', 'userWatcher']); // batch
+UpState.unsubscribe('myWatcher');
 ```
-
-Throws if a key is not a string or is not found in the registry.
 
 ---
 
 ### `UpState.batchSet(arrayOfSetObjects)`
 
-Writes multiple state values efficiently. Individual subscription callbacks and `"update"` events are suppressed during the writes, then subscriptions fire once per unique changed route, and a single `"update"` event is dispatched.
+Writes multiple values in a single operation. Subscriptions are fired once per affected route after all writes complete, and a single `"update"` event is dispatched.
 
 ```js
 UpState.batchSet([
-  { collection: 'user', route: 'name',  state: 'Alice' },
-  { collection: 'user', route: 'age',   state: 30 },
+  { collection: 'user', route: 'name', state: 'Alice' },
+  { collection: 'user', route: 'age', state: 30 },
   { collection: 'settings', state: { theme: 'dark' } }
 ]);
 ```
@@ -408,373 +344,366 @@ UpState.batchSet([
 
 ### `UpState.batchGet(arrayOfGetRequests)`
 
-Reads multiple values in one call. Returns a single `Result` whose `.raw` value is an object keyed by collection name, where each value is an array of the requested values in the order they were specified.
+Reads multiple values in a single call. Returns an array of `Result` instances in the same order as the input.
 
 ```js
-const result = UpState.batchGet([
+const [user, settings] = UpState.batchGet([
   { collection: 'user' },
-  { collection: 'user', route: 'address.city' },
-  { collection: 'cart' }
+  { collection: 'settings' }
 ]);
-result.raw; // { user: [{ name: 'Alice', age: 30 }, 'London'], cart: [{ items: [] }] }
+
+user.raw;     // { name: 'Alice', age: 30 }
+settings.raw; // { theme: 'dark' }
 ```
 
 ---
 
 ### `UpState.batchRemove(arrayOfRemoveRequests)`
 
-Removes multiple values efficiently. Works analogously to `batchSet` — subscriptions are suppressed during deletion then fired once per affected collection, and a single `"update"` event is dispatched.
+Removes multiple values in a single operation. Subscriptions are fired once per affected route, and a single `"update"` event is dispatched.
 
 ```js
 UpState.batchRemove([
   { collection: 'cart' },
-  { collection: 'user', route: 'session.token' }
+  { collection: 'user', route: 'profile.avatar' }
 ]);
 ```
 
 ---
 
-### `UpState.batchSubscriptions(arrayOfSubscriptionObjects)`
+### `UpState.batchSubscribe(arrayOfSubscriptionObjects)`
 
-Registers multiple subscriptions in a single call. Each item in the array matches the signature of `subscribe()`. Returns a **keyed object** (not an array) mapping each subscription's `key` to its `unsub` function.
+Registers multiple subscriptions in a single call. Returns an object mapping each subscription's `key` to its `unsub` function.
 
 ```js
-const unsubs = UpState.batchSubscriptions([
-  { collection: 'user',    key: 'userSub',    callback: onUser    },
-  { collection: 'cart',    key: 'cartSub',    callback: onCart    },
-  { collection: 'session', key: 'sessionSub', callback: onSession },
+const unsubs = UpState.batchSubscribe([
+  { collection: 'user', key: 'watchUser', callback: (v) => console.log('user:', v) },
+  { collection: 'cart', key: 'watchCart', callback: (v) => console.log('cart:', v) }
 ]);
 
-// Unsubscribe individually
-unsubs.cartSub();
-
-// Or unsubscribe all
-Object.values(unsubs).forEach(fn => fn());
+unsubs.watchUser(); // unsubscribe individually
 ```
+
+All objects must include a `key` for the returned map to be useful.
 
 ---
 
 ### `UpState.batchUnsubscribe(keys)`
 
-Removes multiple subscriptions in one call. Requires an array — throws a specific error if the argument is not an array.
+Removes multiple subscriptions by key in a single call.
 
 ```js
-UpState.batchUnsubscribe(['userSub', 'cartSub', 'sessionSub']);
+UpState.batchUnsubscribe(['watchUser', 'watchCart']);
+```
+
+---
+
+### `UpState.purge(options?)`
+
+Wipes all in-memory state, subscriptions, split-route caches, and persistent collection configuration. By default, also clears `localStorage` and `sessionStorage`.
+
+```js
+// Full reset — clears everything including storage
+UpState.purge();
+
+// Keep storage — wipes runtime state but leaves persisted data intact
+UpState.purge({ keepStorage: true });
+```
+
+A `"purge"` CustomEvent is dispatched on the instance after the operation completes:
+
+```js
+UpState.on('purge', ({ detail }) => {
+  console.log('Purged at', detail.timestamp);
+  redirectToLogin();
+});
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `keepStorage` | `boolean` | `false` | When `true`, skips clearing `localStorage` and `sessionStorage`. |
+
+---
+
+## The Debug API
+
+The `debug` object on every `State` instance provides read-only introspection into the internal workings of UpState. All methods are frozen and return deep clones — they will never mutate state.
+
+```js
+UpState.debug.metrics();
+```
+
+### `debug.stateSnapshot()`
+
+Returns a deep clone of the entire internal state tree.
+
+```js
+UpState.debug.stateSnapshot();
+// { user: { name: 'Alice' }, cart: { items: [] } }
+```
+
+### `debug.collections()`
+
+Returns an array of all current collection names.
+
+```js
+UpState.debug.collections();
+// ['user', 'cart', 'settings']
+```
+
+### `debug.routes(collection)`
+
+Returns a flat array of all dot-separated routes within a collection, including nested paths.
+
+```js
+UpState.debug.routes('user');
+// ['name', 'profile', 'profile.avatar', 'profile.bio']
+```
+
+### `debug.activeSubscriptions()`
+
+Returns a breakdown of all active subscriptions grouped by collection and route.
+
+```js
+UpState.debug.activeSubscriptions();
+// {
+//   user: {
+//     '<entire-collection>': [{ key: 'watchUser', propagation: 'none' }],
+//     'profile.name':        [{ key: 'nameWatcher', propagation: 'none' }]
+//   }
+// }
+```
+
+### `debug.has(collection, route?)`
+
+Returns `true` if the collection (or the specific route within it) exists in state.
+
+```js
+UpState.debug.has('user');               // true
+UpState.debug.has('user', 'profile.name'); // true
+UpState.debug.has('user', 'missing.key'); // false
+```
+
+### `debug.routeInspect(collection, route?)`
+
+Returns detailed information about a specific path in state.
+
+```js
+UpState.debug.routeInspect('user', 'profile.name');
+// {
+//   exists:     true,
+//   type:       'string',
+//   collection: 'user',
+//   route:      'profile.name',
+//   value:      'Alice'
+// }
+```
+
+### `debug.metrics()`
+
+Returns a summary of the current state of the UpState instance.
+
+```js
+UpState.debug.metrics();
+// {
+//   version:          '5.0.0',
+//   collections:      3,
+//   subscriptions:    7,
+//   splitRouteCaches: 4
+// }
+```
+
+### `debug.persistence()`
+
+Returns the persistent collection configuration registered via `config()`.
+
+```js
+UpState.debug.persistence();
+// { settings: { type: 'permanent', expiry: 'never' }, auth: { type: 'session', expiry: 'never' } }
+```
+
+### `debug.splitRouteCacheInfo()`
+
+Returns the current state of the internal split-route cache, which UpState uses to avoid re-splitting route strings on every subscription check.
+
+```js
+UpState.debug.splitRouteCacheInfo();
+// { splitRouteCache: { size: 4, keys: ['user', 'cart', ...] } }
+```
+
+### `debug.clearSplitRouteCache()`
+
+Manually clears the split-route cache. Returns the number of cleared entries. This is rarely needed — the cache self-evicts at 1000 entries per collection.
+
+```js
+UpState.debug.clearSplitRouteCache();
+// { cleared: 4 }
+```
+
+### `debug.trace(options?)`
+
+Subscribes to a collection or route with `propagation: "tree"` and logs every change to the console, including the timestamp and current value. Auto-removes after `ttl` milliseconds (default: 60 seconds).
+
+Returns a `stopTrace` function for manual cleanup.
+
+```js
+// Trace an entire collection
+const stop = UpState.debug.trace({ collection: 'user' });
+
+// Trace a specific route with a 10-second TTL
+UpState.debug.trace({ collection: 'user', route: 'profile.name', ttl: 10000 });
+
+// Stop tracing manually
+stop();
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `collection` | `string` | — | The collection to trace. |
+| `route` | `string` | — | The nested path to trace. Omit to trace the entire collection. |
+| `key` | `string` | — | A unique key for the trace subscription. Auto-generated if omitted. |
+| `ttl` | `number` | `60000` | Milliseconds before the trace auto-removes itself. |
+
+### `debug.version()`
+
+Prints the UpState console banner and returns the version string.
+
+```js
+UpState.debug.version(); // logs banner, returns '5.0.0'
 ```
 
 ---
 
 ## Result
 
-All `get` and `batchGet` calls return a **frozen** `Result` object. It normalises the underlying data so consumers never have to guard against `null` or `undefined`.
+Every `get()` and `batchGet()` call returns a `Result` instance, which wraps the retrieved value and provides safe coercion helpers.
 
 ```js
 const result = UpState.get('user');
 
-result.raw;      // raw value, or null if missing
-result.asArray;  // always an array
-result.asObject; // always a plain object
+result.raw;         // the raw value as stored, or null if not found
+result.asArray;     // always returns an array, never throws
+result.asObject;    // always returns an object, never throws
 
-result.mapArray((value, index) => value * 2);
-result.mapObject((value, key) => value.toUpperCase());
+result.mapArray((item, index) => item.name); // map over .asArray
+result.mapObject((value, key) => value * 2); // map over .asObject
 ```
 
-### Coercion rules
+`Result` instances are frozen — they cannot be mutated.
 
-| Accessor | If null | If array | If object | If primitive |
-|---|---|---|---|---|
-| `.raw` | `null` | array | object | primitive |
-| `.asArray` | `[]` | returned as-is | `Object.values(data)` | `[data]` |
-| `.asObject` | `{}` | index-keyed: `{ 0: item0, ... }` | returned as-is | `{ 0: data }` |
-
-### Methods
-
-| Method | Null behaviour |
+| Accessor | Behaviour when value is `null` |
 |---|---|
-| `.mapArray(fn)` | Maps over `[]`, returns `[]` |
-| `.mapObject(fn)` | Maps over `{}`, returns `{}` |
-
-`mapArray` receives `(value, index)`. `mapObject` receives `(value, key)`. Undefined/null return values from the callback are coerced to `null`.
-
-```js
-UpState.get('users').mapArray(user => user.name);
-// → ['Alice', 'Bob', 'Charlie']
-
-UpState.get('users').mapObject((user, id) => `${id}:${user.name}`);
-// → { alice: 'alice:Alice', bob: 'bob:Bob' }
-```
+| `.raw` | Returns `null` |
+| `.asArray` | Returns `[]` |
+| `.asObject` | Returns `{}` |
 
 ---
 
 ## Persistence
 
-State is persisted under a single `"UpState"` key in `localStorage` or `sessionStorage`.
+UpState can persist any collection or individual write to `sessionStorage` or `localStorage`.
 
-On page load, UpState automatically merges persisted state. The merge order is: **session storage data wins over permanent data** on key conflicts. This means values persisted to `sessionStorage` take precedence over values persisted to `localStorage` when the same key exists in both.
+### Via `config()`
 
-ISO 8601 date strings are automatically revived as `Date` objects when reading from storage.
+Register entire collections as persistent at startup:
 
 ```js
 UpState.config({
   persistentCollections: {
-    user:     'session',   // cleared when tab closes
-    settings: 'permanent'  // survives tab close
+    settings: 'permanent',                          // localStorage, no expiry
+    auth:     { type: 'session', expiry: '8h' }    // sessionStorage, expires after 8 hours
   }
-});
-
-// Call-level persistence overrides collection-level config
-UpState.set({
-  collection: 'auth',
-  route:      'token',
-  state:      'abc123',
-  persistence: 'session'
 });
 ```
 
-> **Important:** `persistentCollections` in `config()` only registers collections that **already exist in state** at the time `config()` is called. If you set a collection after calling `config()`, pass `persistence` directly to `set()`.
+All subsequent `set()` calls to these collections will be automatically persisted.
+
+### Via `set()`
+
+Override persistence on a per-write basis:
+
+```js
+UpState.set({
+  collection: 'auth',
+  state: { token: 'xyz' },
+  persistence: { type: 'permanent', expiry: '30d' }
+});
+```
+
+Call-level `persistence` always takes priority over the collection-level default from `config()`.
+
+### Expiry shorthand
+
+| Shorthand | Duration |
+|---|---|
+| `"never"` | No expiry (default) |
+| `500` | 500 milliseconds |
+| `"500ms"` | 500 milliseconds |
+| `"30s"` | 30 seconds |
+| `"30m"` | 30 minutes |
+| `"12h"` | 12 hours |
+| `"7d"` | 7 days |
+
+Expired entries are silently stripped when state is loaded from storage on the next page load.
 
 ### Persistence limitations
 
-UpState uses `JSON.stringify` for persistence. Only JSON-safe data can be stored. The following types work at runtime but are **not restored correctly after a page reload**:
+Only JSON-safe types survive a page reload:
 
-- `Map` and `Set` — converted to JSON-compatible structures
-- `Function`, `Symbol`, `BigInt` — stripped entirely
-- Class instances — lose prototype chains
-- DOM nodes (`window`, `HTMLElement`, `File`, etc.) — cannot be cloned or serialised
-- Circular references — not supported in persistence (JSON limitation)
+| Type | Persisted? |
+|---|---|
+| `string`, `number`, `boolean`, `null` | ✅ |
+| Plain objects and arrays | ✅ |
+| `Date` (as ISO 8601 string, auto-revived on load) | ✅ |
+| `undefined` | ❌ |
+| `Map`, `Set` | ❌ |
+| `RegExp` | ❌ |
+| Class instances | ❌ |
+| Functions | ❌ |
+| Circular references | ❌ |
 
 ---
 
 ## Subscriptions In Depth
 
-### How propagation works
+### `propagation`
 
-UpState compares the path that changed against the path each subscription is watching. Two paths are "related" if they share a common prefix (the shorter of the two). Given that shared prefix:
+Controls which related route changes will trigger a given callback. Accepts one of four string values:
 
-- `"ancestors"` fires when the subscription's path is **shorter or equal** to the changed path (the subscription watches a node above or at the change).
-- `"descendants"` fires when the changed path is **shorter or equal** to the subscription's path (the subscription watches a node at or below the change).
-- `"related"` fires for any shared prefix (either direction).
-- `"exact"` fires only when both paths are identical.
-
-The callback always receives the value **at the subscribed route**, not the value at the route that changed.
-
-```js
-// Subscribed to 'user' (whole collection) with propagation: 'descendants'
-UpState.set({ collection: 'user', state: { name: 'Alice' } }); // fires — collection set
-UpState.set({ collection: 'user', route: 'name', state: 'Bob' }); // fires — descendant changed
-
-// Subscribed to 'user.name' with propagation: 'ancestors'
-UpState.set({ collection: 'user', state: { name: 'Alice' } }); // fires — ancestor replaced
-UpState.set({ collection: 'user', route: 'name', state: 'Bob' }); // fires — exact match also triggers ancestors
-```
-
-### Route-split cache
-
-UpState maintains an LRU cache per collection of up to 1000 pre-split route strings. This avoids redundant `String.split` work on hot subscription paths in high-frequency update scenarios.
-
----
-
-## Emit Bus
-
-The emit bus is a fire-and-forget state broadcast system. Use it to push state snapshots or arbitrary payloads to listeners registered elsewhere in your application, without those listeners needing a direct reference to the sender.
-
-The emit bus uses an internal private `EventTarget` (`#bus`), separate from the public `"update"` event channel.
-
-### `UpState.emitState(options)`
-
-Broadcasts a payload (and optionally a state snapshot) to all `onEmit` listeners registered under `name`.
+| Value | Alias (also accepted) | Behaviour |
+|---|---|---|
+| `"self"` | `"none"` | Only fires when the exact subscribed route is changed (default). |
+| `"descendants"` | `"up"` | Fires when the subscribed route **or any child route** is changed. |
+| `"ancestors"` | `"down"` | Fires when the subscribed route **or any parent route** is changed. |
+| `"tree"` | `"both"` | Fires when the subscribed route or any ancestor or descendant route is changed. |
 
 ```js
-// Broadcast current user state to all 'userChanged' listeners
-UpState.emitState({
-  name: 'userChanged',
+// Fires whenever anything inside 'user.profile' (or deeper) changes
+UpState.subscribe({
   collection: 'user',
-  transform: (result) => result.raw
-});
-
-// Broadcast an arbitrary payload with no state snapshot
-UpState.emitState({
-  name: 'appReady',
-  payload: { timestamp: Date.now() }
-});
-
-// Include a callback listeners can call to reply back
-UpState.emitState({
-  name: 'requestData',
-  payload: { page: 1 },
-  callback: (replyData) => console.log('Listener replied:', replyData)
+  route: 'profile',
+  propagation: 'descendants',
+  key: 'profileWatcher',
+  callback: (value) => console.log('profile subtree changed:', value)
 });
 ```
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `name` | `string` | ✅ | Event name to broadcast on |
-| `payload` | `*` | — | Arbitrary data passed to the listener |
-| `collection` | `string` | — | Collection to snapshot and include in the broadcast |
-| `route` | `string` | — | Route within the collection to snapshot |
-| `transform` | `Function` | — | `(Result) => *` applied to the state snapshot before dispatching. Useful for reshaping without mutating state. |
-| `callback` | `Function` | — | A function listeners can invoke to send data back to the emitter |
-| `id` | `string \| number` | — | Optional identifier (available to listeners but not used internally) |
+### Callback value
 
-### `UpState.onEmit(options)`
+The callback always receives the value **at the subscribed route**, not at the route that actually changed. This means a `"descendants"` subscription on `"user.profile"` will always receive the `user.profile` object, even if `user.profile.name` was the actual change.
 
-Registers a listener for `emitState` broadcasts on `name`. Only **one** listener per `name` is allowed at a time — call `killOnEmit` before re-registering.
-
-The callback receives `{ payload, data, callback }`:
-- `payload` — the arbitrary data from `emitState`
-- `data` — the (optionally transformed) state snapshot, or a `Result` if no transform was applied
-- `callback` — the reply function from `emitState`, if one was provided
+### Unsubscribing
 
 ```js
-UpState.onEmit({
-  name: 'userChanged',
-  callback: ({ payload, data, callback }) => {
-    renderUserBadge(data);
-    if (callback) callback({ acknowledged: true });
-  }
-});
-```
+// Via the returned function
+const unsub = UpState.subscribe({ ... });
+unsub();
 
-### `UpState.killOnEmit(name)`
+// Via key
+UpState.unsubscribe('myKey');
 
-Removes the `onEmit` listener registered under `name`.
-
-```js
-UpState.killOnEmit('userChanged');
-```
-
----
-
-## Request / Response Bus
-
-The request/response bus enables **decoupled cross-module communication**. A module can make a typed request without knowing which module will fulfil it. The fulfilling module handles the request and calls `response()` when ready. This is useful for lazy data loading, service-style modules, and keeping modules from directly importing each other.
-
-Like the emit bus, this uses the internal `#bus` (not the public `"update"` event channel).
-
-### Flow
-
-```
-Module A                                Module B
-─────────────────────────────────────────────────────────
-1. request({ name: 'fetchUser', ... })
-                                 ─────→ onRequest fires
-                                        callback(uid, payload)
-                                        ... fetch data ...
-                                        response(uid, data)
-   onResponse fires ←─────
-   callback({ error, payload })
-```
-
-### `UpState.request(options)`
-
-Sends a typed request on the internal bus. Returns a unique UID string that identifies this request.
-
-```js
-const uid = UpState.request({
-  name: 'fetchUser',
-  payload: { userId: 42 },
-  destination: { collection: 'user' }, // auto-write response to state
-  ttl: 30,                              // timeout in seconds (default: 120)
-  callback: ({ error, payload }) => {
-    if (!error) console.log('User loaded:', payload);
-  }
-});
-```
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `name` | `string` | ✅ | Request type / channel name |
-| `payload` | `*` | — | Data to send to the handler |
-| `destination` | `Object` | — | `{ collection, route? }`. If provided, the resolved response is automatically written to state via `set()` after the response arrives. |
-| `callback` | `Function` | — | `({ error, payload }) => void`. Called with the resolved response when it arrives. |
-| `transform` | `Function` | — | `(data) => *` applied to the response before passing to `callback` and writing to `destination`. |
-| `ttl` | `number` | — | Time-to-live in seconds. Defaults to `120`. On expiry, `onResponse` is called with `{ error: true, payload: null }`. |
-| `id` | `string \| number` | — | Custom UID. If omitted, `crypto.randomUUID()` is used. |
-
-### `UpState.onRequest(options)`
-
-Registers a handler for a specific request type. Only **one** handler per `name` is allowed at a time.
-
-The callback receives `(uid, payload)`:
-- `uid` — the unique request ID; **pass this to `response(uid, data)`**
-- `payload` — the data sent by the requester
-
-```js
-UpState.onRequest({
-  name: 'fetchUser',
-  callback: async (uid, payload) => {
-    const user = await api.getUser(payload.userId);
-    UpState.response(uid, user);
-  }
-});
-```
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `name` | `string` | ✅ | Request type to handle |
-| `callback` | `Function` | ✅ | `(uid, payload) => void` |
-| `id` | `string \| number` | — | Override the UID used for routing (advanced use) |
-
-### `UpState.response(id, data)` or `UpState.response({ id, data })`
-
-Resolves a pending request with data. Must be called by the `onRequest` handler once it has a result.
-
-Supports both positional `(id, data)` and object-form `({ id, data })` calls.
-
-```js
-// Positional form
-UpState.response(uid, { name: 'Alice', age: 30 });
-
-// Object form
-UpState.response({ id: uid, data: { name: 'Alice', age: 30 } });
-```
-
-After calling `response()`:
-1. Any `transform` registered by the requester is applied to `data`.
-2. The requester's `callback` (if any) is called with the resolved value.
-3. The value is written to `destination` in state (if any was specified).
-4. The TTL timeout for this request is cleared.
-5. The `onResponse` listener is invoked.
-
-Throws if `id` is not found in the pending request cache (already resolved, timed out, or unknown).
-
-### `UpState.onResponse(options)`
-
-Listens for the response to a specific request by UID. By default, the listener removes itself after one invocation (`once: true`).
-
-```js
-const uid = UpState.request({ name: 'loadData', payload: { page: 1 } });
-
-UpState.onResponse({
-  id: uid,
-  callback: ({ error, payload }) => {
-    if (error) return console.error('Request timed out');
-    renderData(payload);
-  }
-});
-```
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `id` | `string \| number` | ✅ | The UID returned by `request()` |
-| `callback` | `Function` | ✅ | `({ error, payload }) => void`. `error` is `true` on TTL timeout. |
-| `once` | `boolean` | — | Auto-remove after first invocation. Defaults to `true`. |
-| `abortController` | `AbortController` | — | External abort signal for manual cleanup. |
-
-### `UpState.killOnRequest(name)`
-
-Removes the `onRequest` handler registered under `name`.
-
-```js
-UpState.killOnRequest('fetchUser');
-```
-
-### `UpState.killOnResponse(id)`
-
-Removes the `onResponse` listener registered for request `id`.
-
-```js
-UpState.killOnResponse(uid);
+// Via batchUnsubscribe
+UpState.batchUnsubscribe(['key1', 'key2']);
 ```
 
 ---
@@ -786,7 +715,7 @@ UpState extends `EventTarget`. Listen for all state changes globally on the inst
 ```js
 UpState.addEventListener('update', (event) => {
   const { action, collection, route, state } = event.detail;
-  console.log(action, collection); // "set" "user"
+  console.log(action, collection); // e.g. "set" "user"
 });
 ```
 
@@ -797,23 +726,22 @@ UpState.addEventListener('update', (event) => {
 | `"set"` | `action, collection, route, state, destination` |
 | `"remove"` | `action, collection, route, state, destination` |
 | `"batchSet"` | `action, count, routeMap` |
-| `"batchRemove"` | `action, count, collections` |
+| `"batchRemove"` | `action, count, routeMap` |
 
 > The `"update"` event can be disabled globally with `config({ allowEventDispatches: false })`.
+
+A separate `"purge"` event is dispatched after `purge()` completes, with `detail: { timestamp }`.
 
 ---
 
 ## EventTarget Aliases
 
-For convenience, three shorthand aliases are attached to the UpState instance during construction:
+For convenience, two shorthand aliases are attached to the UpState instance:
 
 ```js
 UpState.on('update', handler);   // alias for addEventListener
 UpState.off('update', handler);  // alias for removeEventListener
-UpState.emit(new CustomEvent('update', { ... })); // alias for dispatchEvent
 ```
-
-These are direct bindings to the native `EventTarget` methods — no extra behaviour.
 
 ---
 
@@ -883,6 +811,55 @@ try {
 
 ---
 
+## Cloning Modes
+
+Controls how state is cloned on `set`, `get`, and subscription callbacks.
+
+| Mode | Behaviour | Use case |
+|---|---|---|
+| `"deep"` | Full `structuredClone` — no shared references (default) | Safety first |
+| `"shallow"` | Top-level spread only — nested objects are shared | Large flat objects |
+| `"off"` | No cloning — direct reference to internal state | Maximum performance |
+
+Apply one mode to all operations, or configure per-operation:
+
+```js
+UpState.config({
+  cloning: { onSet: 'deep', onGet: 'shallow', onSubscribe: 'off' }
+});
+```
+
+### Benchmark (realistic app-scale state)
+
+Tested on 1000 users + nested settings + 500 log entries, 100 cycles:
+
+| Mode | Avg Set | Avg Get |
+|---|---|---|
+| `deep` | 14.50ms | 0.01ms |
+| `shallow` | 0.003ms | 0.003ms |
+| `off` | 0.002ms | 0.001ms |
+
+`get` is fast across all modes — UpState only clones the retrieved value, not the whole state.
+
+---
+
+## `structuredClone` Warning
+
+> ⚠️ **Storing values that `structuredClone` cannot handle will make UpState significantly slower.**
+
+UpState's deep clone strategy first attempts `structuredClone`. If the value contains anything `structuredClone` cannot handle — class instances with methods, DOM nodes, `EventTarget`s, `WeakMap`s, functions, and similar — the attempt throws, and UpState falls back to a slower manual recursive clone.
+
+The manual fallback has two consequences:
+
+1. **Performance degrades.** The manual clone is meaningfully slower than `structuredClone`, particularly for large or deeply nested objects.
+2. **Uncloneable things are silently dropped.** Functions are removed. Class instances lose their prototype chains and become plain objects. DOM node references are discarded. You will not get an error — you will simply get less data than you put in.
+
+Store plain data. If you are consuming objects from a third-party SDK or library, extract only the primitive fields you need before passing them to `set()`. See [Third-party Object Warning](#third-party-object-warning) for an example.
+
+If you are intentionally storing non-cloneable references and want to opt out of this behaviour entirely, set `cloning: "off"` in config — but note this means all callers share the same object reference, which can cause hard-to-track bugs.
+
+---
+
 ## Third-party Object Warning
 
 Objects from SDKs like Firebase contain methods and internal references that cannot be cloned. Store plain data only:
@@ -910,9 +887,9 @@ UpState.set({
 
 ### Storage
 
-- All state is stored under a single `"UpState"` key per storage type (session and permanent). There is no per-collection separation in storage.
+- All state is stored under a single namespaced key per storage type (session and permanent). There is no per-collection separation in storage.
 - **Cross-tab writes:** Multiple tabs writing at the same time will overwrite the full state blob. There is no merge strategy — last write wins.
-- **Corrupted JSON:** If the stored JSON is invalid on load, UpState silently falls back to an empty state `{}`. No warning or recovery system is triggered.
+- **Corrupted JSON:** If the stored JSON is invalid on load, UpState silently falls back to an empty state. A console error is logged unless `silenceWarnings` is enabled.
 
 ### Persistence data types
 
@@ -931,11 +908,6 @@ UpState hydrates ISO 8601 strings into `Date` objects on load. Any string that h
 - Large numbers of subscriptions may impact performance. Callback execution time scales with subscription count.
 - No middleware, priority ordering, or interception system.
 
-### Request / Response bus
-
-- Includes TTL expiration and manual cancellation via `AbortController`.
-- Does **not** include automatic retry. Implement retry logic in the `onRequest` handler if needed.
-
 ### Event system
 
 - Built on native `EventTarget`.
@@ -943,7 +915,7 @@ UpState hydrates ISO 8601 strings into `Date` objects on load. Any string that h
 
 ### Object cloning
 
-- DOM nodes and browser objects may not clone correctly.
+- DOM nodes and browser objects may not clone correctly. See [structuredClone Warning](#structuredclone-warning).
 - Functions are removed during deep clone.
 - Class instances lose their prototype chains after cloning.
 - Strict equality (`===`) is not preserved after retrieval.

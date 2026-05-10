@@ -1,19 +1,102 @@
 "use strict";
-// UpState version 4.2.0
+const VERSION = "5.0.0";
 
 const FIREONENTIRECOLLECTION = Symbol("fireOnEntireCollection");
+const UPSTATE_STORAGE_KEY = "__UPSTATE_α_8f2b4491-9081-_LOCAL_4c12-b7d6-ec2026af999a_STORAGE__";
+
+function printSignature() {
+    if (typeof window !== "undefined") {
+        const pkg = {
+            name: "UpState",
+            description: "A high-performance, reactive state engine.",
+            author: "Raymond Ngule",
+            license: "MIT",
+            version: VERSION,
+            repo: "https://github.com/sir-fancypants/UpState",
+        };
+
+        const c = {
+            group: `color: #2898e2; font-weight: bold; font-family: monospace;`,
+            banner: "color: #2898e2; font-family: monospace; font-size: 12px; line-height: 1.1; font-weight: bold;",
+            dot: "color: #a03131; font-weight: bold;",
+            key: "color: #20b9d4; font-family: monospace; font-size: 15px;",
+            val: "font-family: monospace; font-size: 13px;",
+            dim: "color: #20b9d4; font-family: monospace; font-size: 14px;",
+            badge: "background: #2385c6; color: #ffffff; border: 2px solid #cccccc; border-radius: 5px; padding: 5px 6px; font-size: 14px; font-family: monospace; font-weight: bold;",
+        };
+
+        const bannerArt = [
+            " ██╗   ██╗██████╗ ███████╗████████╗ █████╗ ████████╗███████╗",
+            " ██║   ██║██╔══██╗██╔════╝╚══██╔══╝██╔══██╗╚══██╔══╝██╔════╝",
+            " ██║   ██║██████╔╝███████╗   ██║   ███████║   ██║   █████╗  ",
+            " ██║   ██║██╔═══╝ ╚════██║   ██║   ██╔══██║   ██║   ██╔══╝  ",
+            " ╚██████╔╝██║     ███████║   ██║   ██║  ██║   ██║   ███████╗",
+            "  ╚═════╝ ╚═╝     ╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝   ╚══════╝",
+        ].join("\n");
+
+        const rows = [
+            ["version", pkg.version],
+            ["description", pkg.description],
+            ["author", pkg.author],
+            ["license", pkg.license],
+            ["repository", pkg.repo],
+        ];
+
+        console.groupCollapsed(`%c ● SYSTEM READY %c v${pkg.version} %c© 2026 ${pkg.author}`, c.badge, c.dim, c.dim);
+
+        console.log(`%c${bannerArt}`, c.banner);
+
+        rows.forEach(([key, val]) => {
+            const k = `◆ ${key}`.padEnd(16);
+            console.log(`%c${k.slice(0, 1)}%c${k.slice(1)}%c${val}`, c.dot, c.key, c.val);
+        });
+
+        console.groupEnd();
+    }
+}
 
 class Utility {
+    static stripPrototype(object) {
+        return Object.assign(Object.create(null), object);
+    }
 
-    static JSONHydrator(jsonString) {
-        if (!jsonString) return {};
+    static normalizePersistence(persistence) {
+        if (!persistence) return {
+            type: "permanent",
+            expiry: "never"
+        };
+
+        if (typeof persistence === "string") {
+            return { type: persistence, expiry: "never" };
+        }
+
+        return {
+            type: persistence.type,
+            expiry: persistence.expiry ?? "never"
+        };
+    }
+
+    static resolveExpiry(expiry) {
+        if (!expiry || expiry === "never") return null;
+        if (typeof expiry === "number") return Date.now() + expiry;
+
+        // Parse shorthand strings: "30d", "12h", "30m"
+        const units = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+        const match = String(expiry).match(/^(\d+)(ms|s|m|h|d)$/);
+        if (match) return Date.now() + (parseInt(match[1]) * units[match[2]]);
+
+        throw new UpStateError("'expiry' must be 'never', a number (ms), or a shorthand like '30d'", "INVALID_ARG");
+    }
+
+    static JSONHydrator(jsonString, silenceWarnings) {
+        if (!jsonString) return Object.create(null);
 
         // This regex covers the full ISO 8601 spectrum used by JSON.stringify:
         // YYYY-MM-DDTHH:mm:ss.sssZ or YYYY-MM-DDTHH:mm:ss+HH:mm
         const isoDateRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?(Z|[-+]\d{2}:\d{2})?$/;
 
         try {
-            return JSON.parse(jsonString, (key, value) => {
+            const value = JSON.parse(jsonString, (key, value) => {
                 if (typeof value === 'string' && isoDateRegex.test(value)) {
                     const potentialDate = new Date(value);
 
@@ -22,17 +105,50 @@ class Utility {
                 }
                 return value;
             });
+
+            return Utility.stripPrototype(value)
         } catch (e) {
             // Fallback for malformed JSON
+            if (!silenceWarnings) {
+                console.error(`%c ◆ UpState Hydration Error `, "background: #ff4444; color: #fff; font-weight: bold;");
+                console.warn("Reason: Date hydration failure via JSON.parse. Check if your state contains non-serializable objects.");
+                console.warn("Persisted state may be corrupted. Skipping Date hydration to preserve recoverable state. Stored Date objects may be deserialized as strings.");
+            }
+
             try {
-                return JSON.parse(jsonString);
-            } catch {
-                return {};
+                return Utility.stripPrototype(JSON.parse(jsonString));
+            } catch (error) {
+                if (!silenceWarnings) {
+
+                    const c = {
+                        header: "background: #ff0055; color: #ffffff; font-weight: bold; padding: 4px 8px; border-radius: 4px; font-family: monospace;",
+                        msg: "color: #ffb3c6; font-family: monospace;  font-weight: bold;",
+                        dim: "font-family: monospace:",
+                        code: "color: #ffffff; background: #33111a; padding: 2px 4px; border-radius: 2px; font-family: monospace;"
+                    };
+
+                    console.group(`%c ⚠ CRITICAL: PERSISTENT STATE CORRUPT `, c.header);
+                    console.warn("%cReason: JSON.parse catastrophic failure. The stored string is no longer valid JSON.", c.msg);
+                    console.log("%cError Details: %c" + error.message, c.dim, c.code);
+
+                    // Optional: Log the first 50 chars of the corrupt data so the dev can see what happened
+                    if (jsonString) {
+                        console.log("%cPreview of corrupt data: %c" + jsonString.slice(0, 50) + "...", c.dim, c.code);
+                    }
+
+                    console.log("%cAction: UpState has defaulted to the initial state to prevent app crash.", c.dim);
+                    console.groupEnd();
+                }
+
+                return Object.create(null);
             }
         }
     }
 
-    static deepMerge(target, source) {
+    static deepMerge(target = Object.create(null), source = Object.create(null)) {
+        target = target ?? Object.create(null);
+        source = source ?? Object.create(null);
+
         const isArray = Array.isArray(source);
         const output = isArray ? (Array.isArray(target) ? [...target] : []) : { ...(target || {}) };
 
@@ -53,7 +169,7 @@ class Utility {
             }
         }
 
-        return output;
+        return Utility.stripPrototype(output);
     }
 
     static getPathInfo(collection, route, state, write = false) {
@@ -90,52 +206,114 @@ class Utility {
         };
     }
 
-    static clone(object, seen = new WeakMap(), warned = false) {
+    static clone(object, silenceWarnings = false, seen = new WeakMap()) {
 
-        // 1. Primitives and null are fine
-        if (!object || typeof object !== "object") {
+        // 1. Primitives
+        if (object === null || typeof object !== "object") {
             return object;
         }
 
-        // 2. CHECK THE MEMORY: Have we seen this object in this recursion tree?
+        // 2. Circular reference
         if (seen.has(object)) {
             return seen.get(object);
         }
 
+        // 3. Fast path — only attempted once per call chain
         try {
             return structuredClone(object);
         } catch (err) {
-            // WHY? state should be data not behaviour
-            // if (!libraryState.silenceWarnings && !warned) {
-            //     console.warn("structuredClone failed, falling back to manual cleanup", object, err);
-            // }
-
-            // 3. Handle Arrays
-            if (Array.isArray(object)) {
-                const newArr = [];
-                seen.set(object, newArr); // Remember the reference
-                object.forEach((item, index) => {
-                    newArr[index] = this.clone(item, seen, true);
-                });
-                return newArr;
+            if (!silenceWarnings) {
+                console.warn("structuredClone failed, falling back to manual clone", object, err);
             }
-
-            // 4. Handle Objects
-            const newObj = {};
-            seen.set(object, newObj); // Remember the reference before recursing deeper
-
-            for (const key in object) {
-                if (Object.prototype.hasOwnProperty.call(object, key)) {
-                    const val = object[key];
-
-                    // Skip functions and properties that are actually the 'window'
-                    if (typeof val !== 'function' && (typeof window === "undefined" || val !== window)) {
-                        newObj[key] = this.clone(val, seen, true);
-                    }
-                }
-            }
-            return newObj;
         }
+
+        // =========================
+        // Arrays
+        // =========================
+        if (Array.isArray(object)) {
+            const newArr = new Array(object.length); // pre-allocate
+            seen.set(object, newArr);
+
+            for (let i = 0; i < object.length; i++) {
+                const item = object[i];
+                // Inline primitive check avoids a recursive call just to return item
+                newArr[i] = (item === null || typeof item !== "object")
+                    ? item
+                    : this.clone(item, true, seen); // forceManual=true skips structuredClone
+            }
+
+            return newArr;
+        }
+
+        // =========================
+        // Date
+        // =========================
+        if (object instanceof Date) {
+            return new Date(object.getTime());
+        }
+
+        // =========================
+        // RegExp
+        // =========================
+        if (object instanceof RegExp) {
+            return new RegExp(object.source, object.flags);
+        }
+
+        // =========================
+        // Map
+        // =========================
+        if (object instanceof Map) {
+            const newMap = new Map();
+            seen.set(object, newMap);
+
+            // for...of on Map directly — no need for .entries()
+            for (const [key, value] of object) {
+                newMap.set(
+                    this.clone(key, true, seen),
+                    this.clone(value, true, seen)
+                );
+            }
+
+            return newMap;
+        }
+
+        // =========================
+        // Set
+        // =========================
+        if (object instanceof Set) {
+            const newSet = new Set();
+            seen.set(object, newSet);
+
+            // for...of on Set directly — no need for .values()
+            for (const value of object) {
+                newSet.add(this.clone(value, true, seen));
+            }
+
+            return newSet;
+        }
+
+        // =========================
+        // Generic object
+        // =========================
+        const newObj = {};
+        seen.set(object, newObj);
+
+        // Hoist window check — was being evaluated on every property
+        const hasWindow = typeof window !== "undefined";
+
+        for (const key of Object.keys(object)) {
+            const val = object[key];
+
+            if (typeof val === "function") continue;
+            if (hasWindow && val === window) continue;
+
+            // Inline primitive check — avoids recursion overhead for simple values
+            newObj[key] = (val === null || typeof val !== "object")
+                ? val
+                : this.clone(val, true, seen);
+        }
+
+        return newObj;
     }
 }
 
@@ -217,45 +395,100 @@ class Result {
 }
 
 class StorageHandler {
+    constructor(silenceWarnings = false) {
+        this.silenceWarnings = silenceWarnings;
 
-    constructor() {
+        const strip = (raw) => {
+            const parsed = Utility.JSONHydrator(raw || "{}", this.silenceWarnings);
+            const now = Date.now();
 
-        const sessionRaw = sessionStorage.getItem("UpState") || "{}";
-        let sessionParsed;
+            const process = (obj) => {
+                const clean = Object.create(null);
+                for (const key in obj) {
+                    const entry = obj[key];
+                    if (entry?.__upstate_exp !== undefined) {
+                        if (entry.__upstate_exp === null || now < (entry.__upstate_exp ?? 0)) {
+                            const data = entry.__upstate_data;
+                            // Recurse if the unwrapped value is itself a collection
+                            clean[key] = (data && typeof data === "object" && !Array.isArray(data))
+                                ? process(data)
+                                : data;
+                        }
+                    } else {
+                        clean[key] = (entry && typeof entry === "object" && !Array.isArray(entry))
+                            ? process(entry)
+                            : entry;
+                    }
+                }
+                return clean;
+            };
+
+            return process(parsed);
+        };
+
+        let local;
+        let session;
         try {
-            sessionParsed = Utility.JSONHydrator(sessionRaw);
-        } catch {
-            sessionParsed = {};
+            session = sessionStorage.getItem(UPSTATE_STORAGE_KEY);
+        } catch (err) {
+            if (!this.silenceWarnings) {
+                console.warn(
+                    "Failed to read session storage. Resetting session state to prevent app crash.",
+                    err
+                );
+            }
+
+            session = "{}";
         }
 
-        const permanentRaw = localStorage.getItem("UpState") || "{}";
-        let permanentParsed;
         try {
-            permanentParsed = Utility.JSONHydrator(permanentRaw);
-        } catch {
-            permanentParsed = {};
+            local = localStorage.getItem(UPSTATE_STORAGE_KEY)
+        } catch (err) {
+
+            if (!this.silenceWarnings) {
+                console.warn(
+                    "Failed to read local storage. Resetting local state to prevent app crash.",
+                    err
+                );
+            }
+
+            local = "{}";
         }
 
         this.virtualLocalStorage = {
-            session: sessionParsed,
-            permanent: permanentParsed
-        }
+            session: strip(session),
+            permanent: strip(local),
+        };
     }
 
     set({ collection, state, route, persistence }) {
-        const driver = (persistence === "session") ? sessionStorage : localStorage;
-        const localState = this.virtualLocalStorage[persistence] ?? {};
+        const { type, expiry } = Utility.normalizePersistence(persistence);
+        const driver = (type === "session") ? sessionStorage : localStorage;
+        const localState = this.virtualLocalStorage[type] ?? {};
 
-        if (!route) {
-            localState[collection] = state;
-        } else {
-            const { targetParent, targetKey } = Utility.getPathInfo(collection, route, localState, true);
-            if (targetParent) targetParent[targetKey] = state;
+        // Wrap with expiry only when needed
+        let resolvedExpiry;
+
+        try {
+            resolvedExpiry = Utility.resolveExpiry(expiry);
+        } catch (err) {
+            throw new UpStateError(err.message, err?.code || undefined)
         }
 
-        this.virtualLocalStorage[persistence] = localState;
-        driver.setItem("UpState", JSON.stringify(localState));
+        const payload = resolvedExpiry
+            ? { __upstate_exp: resolvedExpiry, __upstate_data: state }
+            : state;
+
+        if (!route) {
+            localState[collection] = payload;
+        } else {
+            const { targetParent, targetKey } = Utility.getPathInfo(collection, route, localState, true);
+            if (targetParent) targetParent[targetKey] = payload;
+        }
+        this.virtualLocalStorage[type] = localState;
+        driver.setItem(UPSTATE_STORAGE_KEY, JSON.stringify(localState));
     }
+
     remove(collection, route) {
 
         const remove = (driver, virtualDriver) => {
@@ -272,7 +505,7 @@ class StorageHandler {
 
             this.virtualLocalStorage[virtualDriver] = localState;
 
-            driver.setItem("UpState", JSON.stringify(localState));
+            driver.setItem(UPSTATE_STORAGE_KEY, JSON.stringify(localState));
         }
 
         remove(localStorage, "permanent");
@@ -280,26 +513,18 @@ class StorageHandler {
     }
 }
 
-const storageHandlerInstance = new StorageHandler();
-
 class State extends EventTarget {
 
     #state = Object.create(null);
 
     #persistentCollections = new Map();
-    #killResponseRegistry = new Map();
-    #killRequestRegistry = new Map();
-    #requestDetailCache = new Map();
-    #killEmitRegistry = new Map();
     #splitRouteCache = new Map();
     #unsubCallbacks = new Map();
     #subscriptions = new Map();
-    #ttlTimeout = new Map();
 
     #allowEventDispatches = true;
+    #unsubscribeOnDelete = true;
     #silenceWarnings = false;
-
-    #bus = new EventTarget();
 
     #cloningOptions = {
         onSet: "deep",
@@ -307,16 +532,43 @@ class State extends EventTarget {
         onSubscribe: "deep"
     }
 
+    debug;
+
     constructor() {
         super();
+
+        this.storageHandlerInstance = new StorageHandler(this.#silenceWarnings);
+
         this.#state = Utility.deepMerge(
-            storageHandlerInstance.virtualLocalStorage.permanent,
-            storageHandlerInstance.virtualLocalStorage.session,
+            this.storageHandlerInstance.virtualLocalStorage.permanent,
+            this.storageHandlerInstance.virtualLocalStorage.session,
         );
 
         this.on = this.addEventListener.bind(this);
         this.off = this.removeEventListener.bind(this);
-        this.emit = this.dispatchEvent.bind(this);
+
+        this.debug = Object.freeze(
+            Object.assign(Object.create(null), {
+                // Data Snapshots
+                stateSnapshot: () => this.#stateSnapshot(),
+                routes: (collection) => this.#routes(collection),
+                activeSubscriptions: () => this.#activeSubscriptions(),
+                collections: () => this.#collections(),
+
+                // Logic & Metrics
+                routeInspect: (collection, route) => this.#routeInspect(collection, route),
+                has: (collection, route) => this.#has(collection, route),
+                metrics: () => this.#metrics(),
+                persistence: () => this.#persistence(),
+                clearSplitRouteCache: () => this.#clearSplitRouteCache(),
+                splitRouteCacheInfo: () => this.#splitRouteCacheInfo(),
+                trace: (options = {}) => this.#trace(options),
+                version: () => {
+                    printSignature();
+                    return VERSION;
+                },
+            })
+        );
     }
 
     config({
@@ -324,10 +576,12 @@ class State extends EventTarget {
         allowEventDispatches = true,
         silenceWarnings = false,
         cloning = "deep",
+        unsubscribeOnDelete = true,
 
     }) {
         this.#allowEventDispatches = !!allowEventDispatches;
         this.#silenceWarnings = !!silenceWarnings;
+        this.#unsubscribeOnDelete = !!unsubscribeOnDelete;
 
         const optionMap = new Set(["deep", "shallow", "off"]);
         if (typeof cloning === "string") {
@@ -361,31 +615,34 @@ class State extends EventTarget {
             }
         }
 
-        if (persistentCollections && !Array.isArray(persistentCollections) && persistentCollections !== undefined) {
-            for (const collectionKey in persistentCollections) {
-                const persistence = persistentCollections[collectionKey];
-                const state = this.#state[collectionKey];
+        if (persistentCollections !== undefined) {
+            if (persistentCollections && !Array.isArray(persistentCollections)) {
+                for (const collectionKey in persistentCollections) {
+                    const persistence = persistentCollections[collectionKey];
+                    const state = this.#state[collectionKey] || {};
 
-                if (state !== undefined) {
-                    this.#persistentCollections.set(collectionKey, persistence);
-                    storageHandlerInstance.set({ collection: collectionKey, state, persistence });
+                    if (state !== undefined) {
+                        this.#persistentCollections.set(collectionKey, Utility.normalizePersistence(persistence));
+                        this.storageHandlerInstance.set({ collection: collectionKey, state, persistence });
+                    }
                 }
-            }
-        } else throw new UpStateError(
-            "'persistentCollections' value has to be an object mapping 'collection' to 'persistence' type",
-            "MISSING_ARG"
-        );
+            } else throw new UpStateError(
+                "'persistentCollections' value has to be an object mapping 'collection' to 'persistence' type",
+                "INVALID_ARG"
+            );
+        }
+
     }
 
     subscribe({ collection, route, callback, key, propagation = "none" } = {}) {
         const propagationOptions = new Set(["none", "both", "up", "down"]);
-        const publicPropagationOptions = new Set(["exact", "related", "ancestors", "descendants"]);
+        const publicPropagationOptions = new Set(["self", "tree", "descendants", "ancestors"]);
 
         switch (propagation) {
-            case "exact": propagation = "none"; break;
-            case "related": propagation = "both"; break;
-            case "ancestors": propagation = "up"; break;
-            case "descendants": propagation = "down"; break;
+            case "self": propagation = "none"; break;
+            case "tree": propagation = "both"; break;
+            case "descendants": propagation = "up"; break;
+            case "ancestors": propagation = "down"; break;
         }
 
         if (!propagationOptions.has(propagation)) {
@@ -399,8 +656,12 @@ class State extends EventTarget {
             throw new UpStateError("'collection' name is required", "MISSING_ARG");
         }
 
+        if (route && typeof route !== "string") {
+            throw new UpStateError("'route' value has to be a String", "INVALID_ARG");
+        }
+
         if (typeof collection !== "string") {
-            throw new UpStateError("'collection' value has to be be a String", "INVALID_ARG");
+            throw new UpStateError("'collection' value has to be a String", "INVALID_ARG");
         }
 
         if (callback === undefined) {
@@ -411,17 +672,15 @@ class State extends EventTarget {
             throw new UpStateError("'subscription' callback has to be a function", "INVALID_ARG");
         }
 
-        if (key === undefined) {
-            throw new UpStateError("'key' is required", "MISSING_ARG");
-        }
-
-        if (typeof key !== "string") {
+        if (key && typeof key !== "string") {
             throw new UpStateError("'key' value has to be a string", "INVALID_ARG");
         }
 
         if (this.#unsubCallbacks.has(key)) {
             throw new UpStateError("the 'key' entered is already in use", "INVALID_ARG");
         }
+
+        key = key ?? crypto.randomUUID();
 
         route = route ?? FIREONENTIRECOLLECTION;
 
@@ -473,10 +732,10 @@ class State extends EventTarget {
         return unsub;
     }
 
-    batchSubscriptions(arrayOfSubscriptionObjects) {
+    batchSubscribe(arrayOfSubscriptionObjects) {
         if (!Array.isArray(arrayOfSubscriptionObjects)) {
             throw new UpStateError(
-                "'batchSubscriptions' was expecting an array of objects meant for the subscribe method",
+                "'batchSubscribe' was expecting an array of objects meant for the subscribe method",
                 "INVALID_ARG"
             );
         }
@@ -490,24 +749,16 @@ class State extends EventTarget {
         return unsubs;
     }
 
-    unsubscribe(keys) {
+    unsubscribe(key) {
 
-        const unsubFunc = (key) => {
-            if (typeof key !== "string") {
-                throw new UpStateError("'key' has to be a string", "INVALID_ARG");
-            }
-            if (!this.#unsubCallbacks.has(key)) {
-                throw new UpStateError(`no subscription found for key "${key}"`, "INVALID_ARG");
-            }
-
-            this.#unsubCallbacks.get(key)();
+        if (typeof key !== "string") {
+            throw new UpStateError("'key' has to be a string", "INVALID_ARG");
+        }
+        if (!this.#unsubCallbacks.has(key)) {
+            throw new UpStateError(`no subscription found for key "${key}"`, "INVALID_ARG");
         }
 
-        if (Array.isArray(keys)) {
-            keys.forEach(key => unsubFunc(key));
-        } else {
-            unsubFunc(keys);
-        }
+        this.#unsubCallbacks.get(key)();
     }
 
     batchUnsubscribe(keys) {
@@ -540,10 +791,6 @@ class State extends EventTarget {
     }
 
     #fireEntireCollection(routeMap, collection, firedCallbacks) {
-        const collectionState = this.#cloneValue(
-            this.#state[collection],
-            this.#cloningOptions.onSubscribe
-        );
 
         routeMap.forEach((value) => {
             value.routeNode.forEach((v) => {
@@ -553,7 +800,21 @@ class State extends EventTarget {
                 // "none" only fires when its exact route is targeted.
                 // For collection-level subs that means a full-collection set(), not a route change.
                 if (v.propagation !== "none" || v.route === FIREONENTIRECOLLECTION) {
-                    v.callback(collectionState);
+                    let data;
+                    if (v.route === FIREONENTIRECOLLECTION) {
+                        data = this.#cloneValue(
+                            this.#state[collection],
+                            this.#cloningOptions.onSubscribe
+                        );
+                    } else {
+                        const { targetParent, targetKey } = Utility.getPathInfo(collection, v.route, this.#state);
+                        data = this.#cloneValue(
+                            targetParent?.[targetKey],
+                            this.#cloningOptions.onSubscribe
+                        );
+                    }
+
+                    v.callback(data);
                 }
             });
         });
@@ -642,7 +903,7 @@ class State extends EventTarget {
         switch (mode) {
             case "off": return value;
             case "shallow": return Array.isArray(value) ? [...value] : { ...value };
-            default: return Utility.clone(value);
+            default: return Utility.clone(value, this.#silenceWarnings);
         }
     }
 
@@ -695,26 +956,30 @@ class State extends EventTarget {
         }
 
         // Call-level persistence takes priority — only fall back to config if no valid value was provided
-        if (typeof persistence !== "string" && persistence !== undefined) {
-            throw new UpStateError(
-                "'persistence' can only be a string",
-                "INVALID_ARG"
-            );
+        // Normalize: accept string shorthand or full object
+        if (persistence !== undefined) {
+            if (typeof persistence === "string") {
 
+                persistence = { type: persistence, expiry: "never" };
+
+            } else if (typeof persistence === "object" && persistence !== null && !Array.isArray(persistence)) {
+                if (!persistence.type) {
+                    throw new UpStateError("persistence object must include a 'type' of 'session' or 'permanent'", "INVALID_ARG");
+                }
+            } else {
+                throw new UpStateError("'persistence' must be a string or an object with a 'type' property", "INVALID_ARG");
+            }
         }
 
+        // Fall back to collection-level config if no call-level persistence
         persistence = persistence ?? this.#persistentCollections.get(collection);
 
         if (persistence) {
-            const persistenceValue = String(persistence).toLowerCase();
-            if (persistenceValue === "permanent" || persistenceValue === "session") {
-                storageHandlerInstance.set({ collection, state, route, persistence },)
-            } else {
-                throw new UpStateError(
-                    "'persistence' value can only be either 'session' or 'permanent'",
-                    "INVALID_ARG"
-                );
+            const type = String(persistence.type).toLowerCase();
+            if (type !== "permanent" && type !== "session") {
+                throw new UpStateError("'persistence' type can only be either 'session' or 'permanent'", "INVALID_ARG");
             }
+            this.storageHandlerInstance.set({ collection, state, route, persistence });
         }
 
         if (dispatchUpdateEvent && this.#allowEventDispatches) {
@@ -771,7 +1036,6 @@ class State extends EventTarget {
 
     #factoryRemove(collection, route, { dispatchUpdateEvent = true, fireSubscriptionCallbacks = true } = {}) {
 
-        // console.log(collection,route)
         fireSubscriptionCallbacks = !!fireSubscriptionCallbacks;
         if (collection === undefined || collection === "") {
             throw new UpStateError("'collection' value has to be be a String", "MISSING_ARG");
@@ -789,6 +1053,27 @@ class State extends EventTarget {
             delete this.#state[collection];
 
             this.#splitRouteCache.delete(collection);
+
+            if (this.#subscriptions.has(collection)) {
+                const subs = this.#subscriptions.get(collection);
+
+                if (!this.#silenceWarnings && !this.#unsubscribeOnDelete) {
+                    console.warn(`the removed collection '${collection}' has active subscriptions that may cause memory leaks or unintended behavior. Consider enabling 'unsubscribeOnDelete' in the config to automatically remove them `)
+                }
+
+                if (this.#unsubscribeOnDelete) {
+                    subs.forEach((value) => {
+                        value.routeNode.forEach((v) => {
+                            this.#unsubCallbacks.get(v.key)?.();
+                        });
+                    });
+
+                    if (!this.#silenceWarnings) {
+                        console.warn(`all subscriptions attached to the collection'${collection}' have been removed`)
+                    }
+                }
+            }
+
             if (fireSubscriptionCallbacks) {
                 this.#fireSubscriptionCallbacks(collection);
             }
@@ -813,7 +1098,7 @@ class State extends EventTarget {
             }
         }
 
-        storageHandlerInstance.remove(collection, route,);
+        this.storageHandlerInstance.remove(collection, route);
 
         if (dispatchUpdateEvent && this.#allowEventDispatches) {
             this.dispatchEvent(new CustomEvent("update", {
@@ -842,6 +1127,7 @@ class State extends EventTarget {
             this.#factorySet(setObject, { fireSubscriptionCallbacks: false, dispatchUpdateEvent: false });
 
             if (!changedRoutes.has(setObject.collection)) changedRoutes.set(setObject.collection, new Set());
+
             changedRoutes.get(setObject.collection).add(setObject.route || null);
 
         });
@@ -873,16 +1159,7 @@ class State extends EventTarget {
             );
         }
 
-        const data = {};
-
-        arrayOfGetRequests.forEach(req => {
-            if (!data[req.collection]) {
-                data[req.collection] = [];
-            }
-            data[req.collection].push(this.get(req.collection, req.route).raw);
-        });
-
-        return new Result(data);
+        return arrayOfGetRequests.map(req => this.get(req.collection, req.route));
     }
 
     batchRemove(arrayOfRemoveRequests) {
@@ -893,312 +1170,253 @@ class State extends EventTarget {
             );
         }
 
-        const collections = [];
+        const changedRoutes = new Map(); // collection → Set of routes
+
         arrayOfRemoveRequests.forEach(removeObject => {
             this.#factoryRemove(removeObject.collection, removeObject.route, {
                 dispatchUpdateEvent: false,
                 fireSubscriptionCallbacks: false
             });
 
-            collections.push(removeObject.collection);
+            if (!changedRoutes.has(removeObject.collection)) {
+                changedRoutes.set(removeObject.collection, new Set());
+            }
+
+            changedRoutes.get(removeObject.collection).add(removeObject.route || null);
         });
 
-        const collectionSet = [...new Set(collections)];
-
-        collectionSet.forEach(collection => this.#fireSubscriptionCallbacks(collection))
+        // Fire per-route, not per-collection — mirrors batchSet behaviour
+        changedRoutes.forEach((routes, collection) => {
+            routes.forEach(route => {
+                this.#fireSubscriptionCallbacks(collection, route ?? undefined);
+            });
+        });
 
         if (this.#allowEventDispatches) {
             this.dispatchEvent(new CustomEvent("update", {
                 detail: {
                     action: "batchRemove",
                     count: arrayOfRemoveRequests.length,
-                    collections: collectionSet,
+                    routeMap: changedRoutes, // updated to match batchSet's event shape
                 },
                 cancelable: true,
             }));
         }
     }
 
-    emitState({ name, id, payload, collection, route, callback, transform } = {}) {
+    purge({ keepStorage = false } = {}) {
 
-        if (name === undefined) {
-            throw new UpStateError(`'name' is required`, "MISSING_ARG");
+        // 1. Drop all subscriptions — bypass individual unsubs to avoid mutation-during-iteration
+        this.#subscriptions.clear();
+        this.#unsubCallbacks.clear();
+
+        // 2. Clear auxiliary caches
+        this.#splitRouteCache.clear();
+
+        // 3. Wipe in-memory state
+        this.#state = Object.create(null);
+
+        // 4. Reset persistent collection config
+        this.#persistentCollections.clear();
+
+        // 5. Clear storage (opt-out with keepStorage: true)
+        if (!keepStorage) {
+            this.storageHandlerInstance.virtualLocalStorage.session = {};
+            this.storageHandlerInstance.virtualLocalStorage.permanent = {};
+            sessionStorage.removeItem(UPSTATE_STORAGE_KEY);
+            localStorage.removeItem(UPSTATE_STORAGE_KEY);
         }
 
-        if (typeof name !== "string") {
-            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
+        // 6. Notify the app that a purge happened, so components can react (redirect to login, etc.)
+        if (this.#allowEventDispatches) {
+            this.dispatchEvent(new CustomEvent("purge", {
+                detail: { timestamp: Date.now() }
+            }));
         }
+    }
 
-        if (id !== undefined && typeof id !== "string" && typeof id !== "number") {
-            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG");
-        }
+    // ---------------------------------------------------------------------------
+    // DEBUG / Introspection APIs
+    // ---------------------------------------------------------------------------
+    #stateSnapshot() {
+        return Utility.clone(this.#state, this.#silenceWarnings);
+    }
 
-        if (typeof callback !== "function" && callback !== undefined) {
-            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
-        }
+    #activeSubscriptions() {
+        const output = {};
 
-        if (typeof transform !== "function" && transform !== undefined) {
-            throw new UpStateError(`'transform' can only be a function`, "INVALID_ARG");
-        }
+        this.#subscriptions.forEach((routeMap, collection) => {
+            output[collection] = {};
 
-        const data = this.get(collection, route);
+            routeMap.forEach((value, route) => {
+                const safeRoute =
+                    route === FIREONENTIRECOLLECTION
+                        ? "<entire-collection>"
+                        : route;
 
-        const resolved = transform ? transform(data) : data;
+                output[collection][safeRoute] = [...value.routeNode.values()].map(sub => ({
+                    key: sub.key,
+                    propagation: sub.propagation,
+                }));
+            });
+        });
 
-        this.#bus.dispatchEvent(
-            new CustomEvent(name, {
-                detail: { payload, data: resolved, callback }
-            })
+        return Utility.clone(output, this.#silenceWarnings);
+    }
+
+    #metrics() {
+        let subscriptionCount = 0;
+
+        this.#subscriptions.forEach(routeMap => {
+            routeMap.forEach(value => {
+                subscriptionCount += value.routeNode.size;
+            });
+        });
+
+        return {
+            version: VERSION,
+            collections: Object.keys(this.#state).length,
+            subscriptions: subscriptionCount,
+            splitRouteCaches: this.#splitRouteCache.size,
+        };
+    }
+
+    #collections() {
+        return Object.keys(this.#state);
+    }
+
+    #routes(collection) {
+        if (!(collection in this.#state)) return [];
+
+        const output = [];
+        const visited = new WeakSet();
+
+        const walk = (obj, prefix = "") => {
+            if (!obj || typeof obj !== "object") return;
+
+            if (visited.has(obj)) return;
+            visited.add(obj);
+
+            Object.keys(obj).forEach((key) => {
+                const route = prefix ? `${prefix}.${key}` : key;
+
+                output.push(route);
+
+                walk(obj[key], route);
+            });
+        };
+
+        walk(this.#state[collection]);
+
+        return output;
+    }
+
+    #has(collection, route) {
+        if (!(collection in this.#state)) return false;
+
+        if (!route) return true;
+
+        const { targetParent, targetKey } =
+            Utility.getPathInfo(collection, route, this.#state);
+
+        return (
+            !!targetParent &&
+            Object.prototype.hasOwnProperty.call(targetParent, targetKey)
         );
     }
 
-    onEmit({ name, callback }) {
+    #persistence() {
+        const output = {};
 
-        if (name === undefined) {
-            throw new UpStateError(`'name' is required`, "MISSING_ARG"
-            );
-        }
+        this.#persistentCollections.forEach((value, key) => {
+            output[key] = Utility.clone(value, this.#silenceWarnings);
+        });
 
-        if (typeof name !== "string") {
-            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
-        }
-
-        if (this.#killEmitRegistry.has(name)) {
-            throw new UpStateError(`there is already an 'onEmit' with this name`, "INVALID_ARG");
-        }
-
-        if (typeof callback !== "function") {
-            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
-        }
-
-        let abortCont = new AbortController();
-
-        this.#bus.addEventListener(name, event => {
-            const detail = event.detail;
-            callback({
-                payload: detail.payload,
-                data: detail.data,
-                callback: detail.callback
-            });
-        }, { signal: abortCont.signal })
-
-        this.#killEmitRegistry.set(name, () => {
-            if (abortCont) {
-                abortCont.abort()
-                abortCont = null;
-            }
-        })
+        return output;
     }
 
-    #kill(name, where) {
-        if (name === undefined) { throw new UpStateError(`'name' is required`, "MISSING_ARG"); }
-        if (typeof name !== "string") { throw new UpStateError(`'name' can only be a string`, "INVALID_ARG"); }
-        if (where.has(name)) {
-            where.get(name)();
-            where.delete(name);
-        }
+    #routeInspect(collection, route) {
+        const exists = this.#has(collection, route);
+
+        const result = exists
+            ? this.get(collection, route).raw
+            : undefined;
+
+        return {
+            exists,
+            type: Array.isArray(result)
+                ? "array"
+                : result === null
+                    ? "null"
+                    : typeof result,
+            collection,
+            route: route ?? null,
+            value: Utility.clone(result, this.#silenceWarnings),
+        };
     }
 
-
-    request({ name, id, payload, destination, callback, transform, ttl = 120 } = {}) {
-
-        ttl = Number(ttl);
-
-        if (isNaN(ttl)) {
-            throw new UpStateError(`'ttl' can only be a number`, "INVALID_ARG");
-        }
-
-        ttl = ttl * 1000;
-
-        if (name === undefined) {
-            throw new UpStateError(`'name' is required`, "MISSING_ARG");
-        }
-
-        if (typeof name !== "string") {
-            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
-        }
-
-
-        if (id !== undefined && typeof id !== "string" && typeof id !== "number") {
-            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG");
-        }
-
-        if (typeof callback !== "function" && callback !== undefined) {
-            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
-        }
-
-        if (typeof transform !== "function" && transform !== undefined) {
-            throw new UpStateError(`'transform' can only be a function`, "INVALID_ARG");
-        }
-
-        const uid = id ?? crypto.randomUUID();
-
-
-        this.#ttlTimeout.set(uid, setTimeout(e => {
-            this.response(uid, {
-                error: true,
-                payload: null
-            });
-            this.#ttlTimeout.delete(uid)
-        }, ttl))
-
-        this.#bus.dispatchEvent(
-            new CustomEvent(name, {
-                detail: {
-                    payload,
-                    destination,
-                    uid,
-                    transform,
-                    callback,
-                    ttl,
-                }
-            })
-        );
-
-        return uid;
+    #splitRouteCacheInfo() {
+        return {
+            splitRouteCache: {
+                size: this.#splitRouteCache.size,
+                keys: [...this.#splitRouteCache.keys()],
+            },
+        };
     }
 
-    onRequest({ name, id, callback }) {
+    #clearSplitRouteCache() {
+        const size = this.#splitRouteCache.size;
 
-        if (id !== undefined && typeof id !== "string" && typeof id !== "number") {
-            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG");
-        }
+        this.#splitRouteCache.clear();
 
-        if (name === undefined) {
-            throw new UpStateError(`'name' is required`, "MISSING_ARG");
-        }
-
-        if (typeof name !== "string") {
-            throw new UpStateError(`'name' can only be a string`, "INVALID_ARG");
-        }
-
-        if (this.#killRequestRegistry.has(name)) {
-            throw new UpStateError(`there is already an 'onRequest' with this name`, "INVALID_ARG");
-        }
-
-        if (callback === undefined) {
-            throw new UpStateError(`'callback' is required`, "INVALID_ARG");
-        }
-
-        if (typeof callback !== "function") {
-            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG");
-        }
-
-        let abortCont = new AbortController();
-
-        this.#bus.addEventListener(name, event => {
-            const detail = event.detail;
-            const uid = id ?? detail.uid;
-
-            const baggage = Object.create(null);
-
-            baggage.uid = detail.uid;
-            baggage.destination = detail.destination;
-            baggage.transform = detail.transform;
-            baggage.callback = detail.callback;
-
-            this.#requestDetailCache.set(uid, baggage);
-
-            callback(uid, detail.payload);
-
-        }, { signal: abortCont.signal })
-
-        this.#killRequestRegistry.set(name, () => {
-            if (abortCont) {
-                abortCont.abort()
-                abortCont = null;
-            }
-        })
+        return {
+            cleared: size,
+        };
     }
 
-    response(idOrObject, data) {
-
-        let id = idOrObject;
-
-        if (typeof idOrObject === "object" && idOrObject !== null) {
-            id = idOrObject.id;
-            data = idOrObject.data;
-        }
-
-        if (!this.#requestDetailCache.has(id)) {
+    #trace({ collection, route, key, ttl = 60000 } = {}) {
+        // 1. Validate TTL
+        const numericTtl = Number(ttl);
+        if (isNaN(numericTtl)) {
             throw new UpStateError(
-                `'id' should be set to the first perimitor of the receiveRequest's callback`,
+                "'ttl' can only be a number",
                 "INVALID_ARG"
             );
         }
 
-        const baggage = this.#requestDetailCache.get(id);
+        key = key || `trace-${collection}-${route || "root"}-${Date.now()}`;
 
-        const resolved = baggage.transform ? baggage.transform(data) : data;
-
-        if (baggage.callback) baggage.callback(resolved);
-        if (baggage.destination) this.set({ ...baggage.destination, state: resolved });
-
-        this.#requestDetailCache.delete(id);
-
-        clearTimeout(this.#ttlTimeout.get(id));
-        this.#ttlTimeout.delete(id);
-
-        this.#bus.dispatchEvent(
-            new CustomEvent(baggage.uid, {
-                detail: { payload: resolved }
-            })
-        );
-    }
-
-    onResponse({ id, once, abortController, callback }) {
-        const options = {};
-        options.once = once ? !!once : true;
-
-        if (abortController !== undefined && !(abortController instanceof AbortController)) {
-            throw new UpStateError(`invalid abortSignal`, "INVALID_ARG");
-        }
-
-        if (id === undefined) {
-            throw new UpStateError(`'id' is required`, "INVALID_ARG"
-            );
-        }
-
-        if (typeof id !== "string" && typeof id !== "number") {
-            throw new UpStateError(`'id' can only be a string`, "INVALID_ARG"
-            );
-        }
-
-        if (this.#killResponseRegistry.has(id)) {
-            throw new UpStateError(`there is already an 'onResponse' with this name`, "INVALID_ARG");
-        }
-
-        if (typeof callback !== "function") {
-            throw new UpStateError(`'callback' can only be a function`, "INVALID_ARG"
-            );
-        }
-
-        abortController = abortController ? abortController : new AbortController();
-        options.signal = abortController.signal;
-
-        this.#bus.addEventListener(id, event => {
-            callback({ error: false, payload: event.detail.payload });
-
-            if (options.once) { this.killOnResponse(id); }
-            clearTimeout(this.#ttlTimeout.get(id));
-            this.#ttlTimeout.delete(id);
-        }, options);
-
-        this.#killResponseRegistry.set(id, () => {
-            if (abortController) {
-                abortController.abort()
-                abortController = null;
+        // 2. Start the subscription
+        const unsub = this.subscribe({
+            collection,
+            route,
+            key,
+            propagation: "tree",
+            callback: (value) => {
+                console.group(`%c ◆ UpState Trace %c ${collection}${route ? `:${route}` : ""}`, "color: #00ffcc; font-weight: bold;", "color: #eee;");
+                console.log("timestamp:", new Date().toISOString());
+                console.log("value:", value);
+                console.groupEnd();
             }
-        })
+        });
+
+        // 3. Define the cleanup function first
+        let ttlId;
+        const stopTrace = () => {
+            unsub();
+            if (ttlId) clearTimeout(ttlId);
+            // Optional: log that the trace was cleaned up
+        };
+
+        // 4. Set the auto-destruct timer
+        ttlId = setTimeout(stopTrace, numericTtl);
+
+        return stopTrace;
     }
-
-    killOnEmit(type) { this.#kill(type, this.#killEmitRegistry) }
-    killOnRequest(type) { this.#kill(type, this.#killRequestRegistry) }
-    killOnResponse(id) { this.#kill(id, this.#killResponseRegistry) }
-
 }
 
 const UpState = new State();
 Object.freeze(UpState);
+
 export { State };
 export default UpState;
